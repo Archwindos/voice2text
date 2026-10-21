@@ -1,0 +1,326 @@
+"""任务流水线：语音转写 -> DeepSeek 整理 -> 导出文件。
+
+设计要点：
+* 所有耗时操作都在调用方（GUI 工作线程）中同步执行，本模块不创建线程；
+* 通过 ``emit(JobEvent)`` 回报进度，由界面线程换算成进度条；
+* 取消使用 ``threading.Event``，在阶段边界与模块内部检查；
+* ASR 模型懒加载并复用；空闲时可由 GUI 调用 :meth:`maybe_unload_idle`
+  主动卸载，保证「轻量」。
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+from . import errors
+from .asr import WhisperASR
+from .config import AppSettings
+from .export import export_result
+from .models import JobEvent, JobOptions, JobResult, RefineOptions, RefineResult
+from .refine import DeepSeekRefiner
+from .util import human_duration, sanitize_filename
+
+log = logging.getLogger(__name__)
+
+Emit = Callable[[JobEvent], None]
+
+
+def _default_asr_factory(settings: AppSettings) -> WhisperASR:
+    return WhisperASR(
+        model_size=settings.asr_model,
+        compute_type=settings.compute_type,
+        cpu_threads=settings.effective_threads(),
+        model_dir=str(settings.resolve_model_dir()),
+        beam_size=settings.beam_size,
+        vad_filter=settings.vad_filter,
+    )
+
+
+def _default_refiner_factory(settings: AppSettings, api_key: str) -> DeepSeekRefiner:
+    return DeepSeekRefiner(
+        api_key=api_key,
+        base_url=settings.api_base_url,
+        model=settings.api_model,
+        timeout=settings.api_timeout,
+        max_retries=settings.api_max_retries,
+    )
+
+
+class Pipeline:
+    """串联各模块的任务执行器（一个实例可复用多次任务）。"""
+
+    def __init__(
+        self,
+        settings: AppSettings,
+        *,
+        asr_factory: Optional[Callable[[AppSettings], WhisperASR]] = None,
+        refiner_factory: Optional[Callable[[AppSettings, str], DeepSeekRefiner]] = None,
+    ) -> None:
+        self.settings = settings
+        self._asr_factory = asr_factory or _default_asr_factory
+        self._refiner_factory = refiner_factory or _default_refiner_factory
+        self._asr: Optional[WhisperASR] = None
+        self._asr_signature: Optional[tuple] = None
+        self._refiner: Optional[DeepSeekRefiner] = None
+        self._refiner_signature: Optional[tuple] = None
+        self._last_activity: float = time.monotonic()
+        self._busy = False
+        self._guard = threading.RLock()
+
+    # ------------------------------------------------------------------
+    # 设置
+    # ------------------------------------------------------------------
+    def apply_settings(self, settings: AppSettings) -> None:
+        """界面「保存设置」后调用；会按需丢弃旧的模型/客户端缓存。"""
+        with self._guard:
+            old_signature = self._asr_signature
+            self.settings = settings
+            if self._asr is not None and old_signature != self._asr_signature_for(settings):
+                self._release_asr()
+            self._refiner = None
+            self._refiner_signature = None
+
+    def _asr_signature_for(self, settings: AppSettings) -> tuple:
+        return (
+            settings.asr_model,
+            settings.compute_type,
+            settings.effective_threads(),
+            settings.beam_size,
+            settings.vad_filter,
+            str(settings.resolve_model_dir()),
+        )
+
+    def _get_asr(self) -> WhisperASR:
+        signature = self._asr_signature_for(self.settings)
+        with self._guard:
+            if self._asr is None or self._asr_signature != signature:
+                self._release_asr()
+                self._asr = self._asr_factory(self.settings)
+                self._asr_signature = signature
+            return self._asr
+
+    def _get_refiner(self) -> DeepSeekRefiner:
+        api_key = self.settings.get_api_key()
+        if not api_key:
+            raise errors.MissingAPIKeyError(
+                "尚未配置 DeepSeek API Key，无法进行文字整理",
+                hint="请在「设置」中填写 API Key（platform.deepseek.com 获取），"
+                "或关闭「AI 整理」只做语音转写。",
+            )
+        signature = (
+            api_key,
+            self.settings.api_base_url,
+            self.settings.api_model,
+            self.settings.api_timeout,
+            self.settings.api_max_retries,
+        )
+        with self._guard:
+            if self._refiner is None or self._refiner_signature != signature:
+                self._refiner = self._refiner_factory(self.settings, api_key)
+                self._refiner_signature = signature
+            return self._refiner
+
+    def _release_asr(self) -> None:
+        if self._asr is not None:
+            try:
+                self._asr.unload()
+            except Exception:  # 卸载失败不影响主流程
+                log.warning("卸载语音模型失败", exc_info=True)
+        self._asr = None
+        self._asr_signature = None
+
+    # ------------------------------------------------------------------
+    # 主流程
+    # ------------------------------------------------------------------
+    def run(
+        self,
+        audio_path: str | Path,
+        job: JobOptions,
+        emit: Emit,
+        cancel: Optional[threading.Event] = None,
+    ) -> JobResult:
+        """处理单个音频文件；异常交由调用方捕获并转换为界面状态。"""
+        cancel = cancel or threading.Event()
+        audio = Path(audio_path)
+        emit(
+            JobEvent(
+                stage="prepare",
+                progress=0.0,
+                message=f"检查文件：{audio.name}",
+                audio_path=str(audio),
+            )
+        )
+        if not audio.exists():
+            raise errors.AudioError(f"找不到音频文件：{audio}")
+        if audio.is_dir():
+            raise errors.AudioError(f"这是一个文件夹，不是音频文件：{audio}")
+        try:
+            if audio.stat().st_size <= 0:
+                raise errors.AudioError(f"音频文件是空的：{audio.name}")
+        except OSError as exc:
+            raise errors.AudioError(f"无法读取音频文件：{audio.name}（{exc}）") from exc
+        if cancel.is_set():
+            raise errors.CancelledError("任务已取消")
+
+        self._busy = True
+        started = time.monotonic()
+        try:
+            # ---------- 1. 语音转写 ----------
+            asr = self._get_asr()
+            emit(
+                JobEvent(
+                    stage="asr",
+                    progress=0.0,
+                    message=f"语音转写中（模型 {self.settings.asr_model}，"
+                    f"{self.settings.effective_threads()} 线程）…",
+                    audio_path=str(audio),
+                )
+            )
+
+            def on_asr_progress(ratio: float, message: str) -> None:
+                if cancel.is_set():
+                    raise errors.CancelledError("任务已取消")
+                emit(
+                    JobEvent(
+                        stage="asr",
+                        progress=max(0.0, min(1.0, float(ratio))),
+                        message=message or "语音转写中…",
+                        audio_path=str(audio),
+                    )
+                )
+
+            transcript = asr.transcribe(
+                audio,
+                language=None if job.language in (None, "", "auto") else job.language,
+                on_progress=on_asr_progress,
+                cancel=cancel,
+            )
+            if transcript.is_empty:
+                raise errors.ASRError(
+                    "没有识别到有效语音内容",
+                    hint="请确认音频中有清晰的人声，或换用更大的识别模型（设置 → 识别模型）。",
+                )
+            if cancel.is_set():
+                raise errors.CancelledError("任务已取消")
+
+            # ---------- 2. DeepSeek 整理 ----------
+            refined: Optional[RefineResult] = None
+            if job.refine:
+                emit(
+                    JobEvent(
+                        stage="refine",
+                        progress=0.0,
+                        message="DeepSeek 正在整理文字…",
+                        audio_path=str(audio),
+                    )
+                )
+                options = RefineOptions(
+                    enabled=True,
+                    style=job.style or self.settings.default_style,
+                    language=(
+                        job.language
+                        if job.language not in (None, "", "auto")
+                        else (transcript.language or "zh")
+                    ),
+                    glossary=self.settings.glossary,
+                )
+
+                def on_refine_progress(ratio: float, message: str) -> None:
+                    if cancel.is_set():
+                        raise errors.CancelledError("任务已取消")
+                    emit(
+                        JobEvent(
+                            stage="refine",
+                            progress=max(0.0, min(1.0, float(ratio))),
+                            message=message or "DeepSeek 正在整理文字…",
+                            audio_path=str(audio),
+                        )
+                    )
+
+                refined = self._get_refiner().refine(
+                    transcript, options, on_progress=on_refine_progress, cancel=cancel
+                )
+                if not (refined.text or "").strip():
+                    raise errors.RefineError(
+                        "DeepSeek 返回了空结果",
+                        hint="可以关闭「AI 整理」后重试，或稍后再试。",
+                    )
+            if cancel.is_set():
+                raise errors.CancelledError("任务已取消")
+
+            # ---------- 3. 导出 ----------
+            emit(
+                JobEvent(
+                    stage="export",
+                    progress=0.0,
+                    message="写出结果文件…",
+                    audio_path=str(audio),
+                )
+            )
+            result = JobResult(
+                audio_path=str(audio), transcript=transcript, refined=refined
+            )
+            out_dir = (
+                Path(job.output_dir) if job.output_dir else self.settings.resolve_output_dir()
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            base_name = sanitize_filename(job.title or audio.stem)
+            files = export_result(
+                result,
+                out_dir=out_dir,
+                base_name=base_name,
+                formats=list(job.export_formats or ["txt"]),
+                title=job.title or audio.stem,
+                include_raw=True,
+            )
+            result.output_files = [str(path) for path in files]
+            result.elapsed = time.monotonic() - started
+            emit(
+                JobEvent(
+                    stage="done",
+                    progress=1.0,
+                    message=f"完成，用时 {human_duration(result.elapsed)}",
+                    audio_path=str(audio),
+                    result=result,
+                )
+            )
+            return result
+        finally:
+            self._last_activity = time.monotonic()
+            self._busy = False
+
+    # ------------------------------------------------------------------
+    # 资源管理
+    # ------------------------------------------------------------------
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    @property
+    def last_activity(self) -> float:
+        return self._last_activity
+
+    def unload(self) -> None:
+        """立即卸载模型（关闭程序或手动释放内存时调用）。"""
+        with self._guard:
+            self._release_asr()
+            self._refiner = None
+            self._refiner_signature = None
+
+    def maybe_unload_idle(self) -> bool:
+        """空闲超过设置时长后卸载 ASR 模型；返回是否执行了卸载。"""
+        idle_seconds = self.settings.idle_unload_seconds()
+        if idle_seconds <= 0 or self._busy or self._asr is None:
+            return False
+        if time.monotonic() - self._last_activity < idle_seconds:
+            return False
+        log.info("空闲 %.0f 秒，自动卸载语音模型释放内存", idle_seconds)
+        self.unload()
+        return True
+
+
+__all__ = ["Pipeline"]
