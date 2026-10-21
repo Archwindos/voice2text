@@ -86,8 +86,16 @@ def process_memory_mb() -> float:
         counters = _ProcessMemoryCounters()
         counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
         kernel32 = ctypes.windll.kernel32
-        process = kernel32.GetCurrentProcess()
         psapi = ctypes.windll.psapi
+        # 必须显式声明签名：GetCurrentProcess 默认按 int 返回，伪句柄 -1 会被截断
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_ProcessMemoryCounters),
+            ctypes.c_ulong,
+        ]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        process = kernel32.GetCurrentProcess()
         ok = psapi.GetProcessMemoryInfo(process, ctypes.byref(counters), counters.cb)
         if ok:
             return counters.WorkingSetSize / (1024 * 1024)

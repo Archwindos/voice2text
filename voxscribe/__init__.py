@@ -12,3 +12,9 @@
 __version__ = "1.0.0"
 APP_NAME = "VoxScribe"
 APP_DISPLAY_NAME = "语声成文"
+
+# 部分网络环境下 Hugging Face 的 Xet 下载通道不可用，改用普通 HTTP 更稳。
+# 必须在 huggingface_hub 被（faster-whisper 懒加载）import 之前设置。
+import os as _os
+
+_os.environ.setdefault("HF_HUB_DISABLE_XET", "1")

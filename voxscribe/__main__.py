@@ -196,7 +196,12 @@ def run_check() -> int:
     print(f"  DeepSeek 模型    : {settings.api_model} @ {settings.api_base_url}")
 
     model_dir = settings.resolve_model_dir()
-    cached = [p.name for p in model_dir.glob("*") if p.is_dir()] if model_dir.exists() else []
+    cached = []
+    if model_dir.exists():
+        for item in sorted(model_dir.glob("models--*")):
+            name = item.name.replace("models--Systran--faster-whisper-", "")
+            if item.is_dir() and "-" != name:
+                cached.append(name)
     print(f"  已缓存识别模型   : {', '.join(cached) if cached else '无（首次转写时自动下载）'}")
     print()
     if failed:

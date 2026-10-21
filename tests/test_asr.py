@@ -1,0 +1,638 @@
+"""语音识别（WhisperASR）与麦克风录音（Recorder）测试。
+
+分两层：
+
+* 单元测试：不下载模型、不依赖麦克风，默认全跑；
+* 端到端测试：用 Windows 中文 TTS 生成的 ``tests/fixtures/tts_zh.wav``，
+  以真实 faster-whisper ``tiny`` 模型转写（模型缓存在项目 ``data/models``）。
+  默认跳过，需要显式开启：
+
+      $env:VOXSCRIBE_RUN_ASR = '1'
+      & .\\.venv\\Scripts\\python.exe -m pytest tests/test_asr.py -q
+
+  首次运行会自动下载 tiny 模型（约 75MB）。若直连 HuggingFace 失败
+  （国内网络常见 DNS/连接问题），可设置镜像后再运行：
+
+      $env:HF_ENDPOINT = 'https://hf-mirror.com'
+      $env:HF_HUB_DISABLE_XET = '1'
+
+  模型下载到 ``data/models`` 后，后续运行（以及 App 本身）完全离线可用。
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import threading
+import time
+import wave
+from pathlib import Path
+from typing import List, Tuple
+
+import pytest
+
+from voxscribe import errors
+from voxscribe.asr import MODEL_SIZE_HINTS, ZH_INITIAL_PROMPT, WhisperASR
+from voxscribe.config import ASR_MODELS
+from voxscribe.recorder import (
+    CHANNELS,
+    MAX_RECORD_SECONDS,
+    SAMPLE_RATE,
+    SAMPLE_WIDTH,
+    Recorder,
+    write_pcm16_wav,
+)
+from voxscribe.util import process_memory_mb
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FIXTURE_AUDIO = PROJECT_ROOT / "tests" / "fixtures" / "tts_zh.wav"
+MAKE_AUDIO_SCRIPT = PROJECT_ROOT / "tools" / "make_test_audio.ps1"
+E2E_MODEL_DIR = PROJECT_ROOT / "data" / "models"
+RUN_ASR = os.environ.get("VOXSCRIBE_RUN_ASR") == "1"
+#: 端到端断言用的关键词：TTS 文本「项目 / 进度 / 前端 / 后端 / 百分之七十 / 两周」。
+#: 同时收纳繁体写法，避免不同模型版本输出繁体时误判失败。
+E2E_KEYWORDS = (
+    "项目", "項目", "进度", "進度", "前端", "后端", "後端",
+    "百分之七十", "两周", "兩週", "会议", "會議", "讨论", "討論",
+)
+
+
+# ---------------------------------------------------------------------------
+# 测试辅助
+# ---------------------------------------------------------------------------
+def _make_fake_hf_cache(
+    model_dir: Path, model_size: str = "small", *, with_model_bin: bool = True
+) -> Path:
+    """伪造 HuggingFace 缓存目录：models--Systran--faster-whisper-<size>。"""
+    repo = f"Systran/faster-whisper-{model_size}"
+    snapshot = (
+        model_dir
+        / ("models--" + repo.replace("/", "--"))
+        / "snapshots"
+        / "0123456789abcdef"
+    )
+    snapshot.mkdir(parents=True, exist_ok=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+    if with_model_bin:
+        (snapshot / "model.bin").write_bytes(b"\x00" * 128)
+    return snapshot
+
+
+class _FakeRawSegment:
+    """模拟 faster_whisper.transcribe.Segment。"""
+
+    def __init__(self, start: float, end: float, text: str) -> None:
+        self.start = start
+        self.end = end
+        self.text = text
+
+
+class _FakeInfo:
+    """模拟 faster_whisper.transcribe.TranscriptionInfo。"""
+
+    def __init__(self, duration: float = 10.0, language: str = "zh") -> None:
+        self.duration = duration
+        self.language = language
+
+
+class _FakeWhisperModel:
+    """不加载真实模型，只验证 WhisperASR 的进度/取消/组装逻辑。"""
+
+    def __init__(self, segments: List[_FakeRawSegment], **info_kwargs) -> None:
+        self._segments = segments
+        self._info = _FakeInfo(**info_kwargs)
+        self.kwargs: dict = {}
+
+    def transcribe(self, audio_path, **kwargs) -> Tuple[object, _FakeInfo]:
+        self.kwargs = kwargs
+        return iter(self._segments), self._info
+
+
+def _asr_with_fake_model(
+    tmp_path: Path, segments: List[_FakeRawSegment], **info_kwargs
+) -> WhisperASR:
+    asr = WhisperASR(model_size="tiny", model_dir=str(tmp_path / "models"))
+    asr._model = _FakeWhisperModel(segments, **info_kwargs)  # noqa: SLF001 白盒注入
+    return asr
+
+
+def _ensure_tts_audio() -> Path:
+    """确保测试音频存在；缺失时调用 tools/make_test_audio.ps1 生成。"""
+    if FIXTURE_AUDIO.is_file() and FIXTURE_AUDIO.stat().st_size > 44:
+        return FIXTURE_AUDIO
+    if os.name != "nt" or not MAKE_AUDIO_SCRIPT.is_file():
+        pytest.skip("缺少中文 TTS 测试音频，且当前环境无法生成")
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        pytest.skip("找不到 PowerShell，无法生成中文 TTS 测试音频")
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(MAKE_AUDIO_SCRIPT),
+            ],
+            capture_output=True,
+            timeout=180,
+        )
+    except Exception as exc:  # pragma: no cover - 环境问题
+        pytest.skip(f"生成中文 TTS 测试音频失败：{exc}")
+    if result.returncode != 0 or not FIXTURE_AUDIO.is_file():
+        stderr = (result.stderr or b"").decode("utf-8", "replace").strip()
+        pytest.skip(f"生成中文 TTS 测试音频失败：{stderr[:300]}")
+    return FIXTURE_AUDIO
+
+
+def _memory_mb() -> float:
+    """当前进程内存（MB）。
+
+    优先调用 ``voxscribe.util.process_memory_mb()``；该函数在本机某些 Python
+    环境下会因 ``GetCurrentProcess()`` 伪句柄被 ctypes 默认按 int 截断而返回
+    0.0（见交付报告），这里用正确的 ctypes 类型兜底，保证能记录真实数字。
+    """
+    value = process_memory_mb()
+    if value > 0 or os.name != "nt":
+        return value
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_MemoryCounters),
+            wintypes.DWORD,
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        counters = _MemoryCounters()
+        counters.cb = ctypes.sizeof(_MemoryCounters)
+        if psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            return counters.WorkingSetSize / (1024 * 1024)
+    except Exception:  # pragma: no cover - 兜底实现失败时不阻塞测试
+        pass
+    return 0.0
+
+
+# ===========================================================================
+# 单元测试：模型信息与本地缓存检测
+# ===========================================================================
+@pytest.mark.parametrize(
+    ("model_size", "expected"),
+    [
+        ("tiny", "75MB"),
+        ("base", "145MB"),
+        ("small", "484MB"),
+        ("medium", "1.5GB"),
+        ("large-v3", "3.1GB"),
+        ("TINY", "75MB"),
+        ("small.en", "484MB"),
+        ("Systran/faster-whisper-small", "484MB"),
+        ("large", "3.1GB"),
+    ],
+)
+def test_model_size_hint(model_size: str, expected: str, tmp_path: Path) -> None:
+    asr = WhisperASR(model_size=model_size, model_dir=str(tmp_path / "models"))
+    assert asr.model_size_hint() == expected
+
+
+def test_model_size_hint_covers_config_models() -> None:
+    for model_size in ASR_MODELS:
+        assert WhisperASR(model_size=model_size).model_size_hint() != "未知大小"
+
+
+def test_model_size_hint_unknown(tmp_path: Path) -> None:
+    asr = WhisperASR(model_size="不存在的规格", model_dir=str(tmp_path / "models"))
+    assert asr.model_size_hint() == "未知大小"
+
+
+def test_model_size_hint_local_model_dir(tmp_path: Path) -> None:
+    local_model = tmp_path / "本地模型"
+    local_model.mkdir()
+    (local_model / "model.bin").write_bytes(b"\x00" * 16)
+    asr = WhisperASR(model_size=str(local_model))
+    assert asr.model_size_hint() == "本地模型"
+    assert asr.is_model_available() is True
+
+
+def test_is_model_available_detects_hf_cache(tmp_path: Path) -> None:
+    model_dir = tmp_path / "models"
+    asr_small = WhisperASR(model_size="small", model_dir=str(model_dir))
+    asr_tiny = WhisperASR(model_size="tiny", model_dir=str(model_dir))
+    assert asr_small.is_model_available() is False
+
+    _make_fake_hf_cache(model_dir, "small")
+    assert asr_small.is_model_available() is True
+    assert asr_tiny.is_model_available() is False
+
+
+def test_is_model_available_ignores_incomplete_cache(tmp_path: Path) -> None:
+    model_dir = tmp_path / "models"
+    _make_fake_hf_cache(model_dir, "small", with_model_bin=False)
+    asr = WhisperASR(model_size="small", model_dir=str(model_dir))
+    assert asr.is_model_available() is False
+
+
+def test_is_model_available_without_model_dir(tmp_path: Path) -> None:
+    asr = WhisperASR(model_size="small", model_dir=str(tmp_path / "不存在" / "models"))
+    assert asr.is_model_available() is False
+
+
+# ===========================================================================
+# 单元测试：加载状态与卸载
+# ===========================================================================
+def test_loaded_and_unload_idempotent(tmp_path: Path) -> None:
+    asr = WhisperASR(model_size="tiny", model_dir=str(tmp_path / "models"))
+    assert asr.loaded is False
+    # 未加载时卸载多次是安全的
+    asr.unload()
+    asr.unload()
+    assert asr.loaded is False
+
+    asr._model = object()  # noqa: SLF001 模拟已加载
+    assert asr.loaded is True
+    asr.unload()
+    assert asr.loaded is False
+    asr.unload()
+    assert asr.loaded is False
+
+
+def test_unload_releases_reference(tmp_path: Path) -> None:
+    asr = WhisperASR(model_size="tiny", model_dir=str(tmp_path / "models"))
+    fake_model = _FakeWhisperModel([])
+    asr._model = fake_model  # noqa: SLF001
+    asr.unload()
+    assert asr._model is None  # noqa: SLF001
+
+
+# ===========================================================================
+# 单元测试：转写主流程（用假模型，不下载）
+# ===========================================================================
+def test_transcribe_builds_transcript_and_progress(tmp_path: Path) -> None:
+    segments = [
+        _FakeRawSegment(0.0, 2.0, "  今天开会  "),
+        _FakeRawSegment(2.0, 4.0, "   "),  # 纯空白：丢弃
+        _FakeRawSegment(4.0, 6.0, "讨论项目进度"),
+    ]
+    asr = _asr_with_fake_model(tmp_path, segments)
+    events: List[Tuple[float, str]] = []
+    transcript = asr.transcribe(
+        tmp_path / "a.wav",
+        language="zh",
+        on_progress=lambda ratio, message: events.append((ratio, message)),
+    )
+
+    assert [segment.text for segment in transcript.segments] == ["今天开会", "讨论项目进度"]
+    assert transcript.segments[0].start == 0.0
+    assert transcript.duration == 10.0
+    assert transcript.language == "zh"
+    assert transcript.text == "今天开会\n讨论项目进度"
+
+    ratios = [ratio for ratio, _ in events]
+    assert ratios[0] == 0.0
+    assert ratios[-1] == 1.0
+    assert all(0.0 <= ratio <= 1.0 for ratio in ratios)
+    assert any("正在转写" in message for _, message in events)
+    assert all(message for _, message in events)
+
+    # 传给 faster-whisper 的关键参数保持默认省资源策略
+    kwargs = asr._model.kwargs  # noqa: SLF001
+    assert kwargs["language"] == "zh"
+    assert kwargs["beam_size"] == 5
+    assert kwargs["vad_filter"] is True
+    assert kwargs["word_timestamps"] is False
+    assert kwargs["task"] == "transcribe"
+    # 中文默认带 initial_prompt（实测能避免繁体输出、提升常用词准确率）
+    assert kwargs["initial_prompt"] == ZH_INITIAL_PROMPT
+
+
+def test_initial_prompt_not_used_for_other_languages(tmp_path: Path) -> None:
+    asr = _asr_with_fake_model(tmp_path, [_FakeRawSegment(0.0, 1.0, "hello")])
+    asr.transcribe(tmp_path / "a.wav", language="en")
+    assert asr._model.kwargs["initial_prompt"] is None  # noqa: SLF001
+
+
+def test_initial_prompt_can_be_overridden(tmp_path: Path) -> None:
+    asr = WhisperASR(
+        model_size="tiny",
+        model_dir=str(tmp_path / "models"),
+        initial_prompt="自定义提示词。",
+    )
+    asr._model = _FakeWhisperModel([_FakeRawSegment(0.0, 1.0, "你好")])  # noqa: SLF001
+    asr.transcribe(tmp_path / "a.wav", language="en")
+    assert asr._model.kwargs["initial_prompt"] == "自定义提示词。"  # noqa: SLF001
+
+
+def test_download_monitor_reports_progress(tmp_path: Path) -> None:
+    """模型下载期间的后台监控线程应持续更新「已下载」消息。"""
+    asr = WhisperASR(model_size="small", model_dir=str(tmp_path / "models"))
+    target = asr._download_target_dir()  # noqa: SLF001
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "model.bin.part").write_bytes(b"\x00" * 512 * 1024)
+
+    messages: List[str] = []
+    monitor = asr._start_download_monitor(  # noqa: SLF001
+        lambda ratio, message: messages.append(message)
+    )
+    try:
+        time.sleep(1.2)
+    finally:
+        asr._stop_monitor(monitor)  # noqa: SLF001
+    assert messages, "下载监控线程没有回调任何消息"
+    assert all("正在下载识别模型" in message for message in messages)
+    assert any("已下载" in message for message in messages)
+
+
+
+def test_transcribe_auto_language_uses_detected(tmp_path: Path) -> None:
+    asr = _asr_with_fake_model(
+        tmp_path, [_FakeRawSegment(0.0, 1.0, "hello")], language="en"
+    )
+    transcript = asr.transcribe(tmp_path / "a.wav", language=None)
+    assert transcript.language == "en"
+    assert asr._model.kwargs["language"] is None  # noqa: SLF001
+
+
+def test_transcribe_cancel_before_start_raises(tmp_path: Path) -> None:
+    asr = WhisperASR(model_size="tiny", model_dir=str(tmp_path / "models"))
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(errors.CancelledError, match="任务已取消"):
+        asr.transcribe(tmp_path / "不存在.wav", cancel=cancel)
+    # 取消优先于模型加载：不应该开始下载/加载
+    assert asr.loaded is False
+
+
+def test_transcribe_cancel_between_segments_raises(tmp_path: Path) -> None:
+    segments = [_FakeRawSegment(i, i + 1, f"第{i}段") for i in range(10)]
+    asr = _asr_with_fake_model(tmp_path, segments)
+    cancel = threading.Event()
+    ratios: List[float] = []
+
+    def on_progress(ratio: float, message: str) -> None:
+        ratios.append(ratio)
+        if len(ratios) >= 2:  # 第一段转写完成后取消
+            cancel.set()
+
+    with pytest.raises(errors.CancelledError, match="任务已取消"):
+        asr.transcribe(tmp_path / "a.wav", on_progress=on_progress, cancel=cancel)
+    assert cancel.is_set()
+
+
+def test_progress_callback_cancelled_error_propagates(tmp_path: Path) -> None:
+    asr = _asr_with_fake_model(tmp_path, [_FakeRawSegment(0.0, 1.0, "你好")])
+
+    def on_progress(ratio: float, message: str) -> None:
+        raise errors.CancelledError("任务已取消")
+
+    with pytest.raises(errors.CancelledError):
+        asr.transcribe(tmp_path / "a.wav", on_progress=on_progress)
+
+
+def test_transcribe_wraps_decode_error(tmp_path: Path) -> None:
+    class _BrokenModel:
+        def transcribe(self, audio_path, **kwargs):
+            raise PermissionError("拒绝访问")
+
+    asr = _asr_with_fake_model(tmp_path, [])
+    asr._model = _BrokenModel()  # noqa: SLF001
+    with pytest.raises(errors.ASRError) as excinfo:
+        asr.transcribe(tmp_path / "a.wav")
+    assert "无法读取音频文件" in str(excinfo.value)
+    assert excinfo.value.user_hint
+
+
+def test_transcribe_wraps_invalid_audio_error(tmp_path: Path) -> None:
+    class _BrokenModel:
+        def transcribe(self, audio_path, **kwargs):
+            raise ValueError("Invalid data found when processing input")
+
+    asr = _asr_with_fake_model(tmp_path, [])
+    asr._model = _BrokenModel()  # noqa: SLF001
+    with pytest.raises(errors.ASRError) as excinfo:
+        asr.transcribe(tmp_path / "损坏.wav")
+    assert "无法解码音频文件" in str(excinfo.value)
+    assert excinfo.value.user_hint
+
+
+def test_invalid_model_size_wrapped_as_asr_error(tmp_path: Path) -> None:
+    asr = WhisperASR(model_size="不存在的模型", model_dir=str(tmp_path / "models"))
+    with pytest.raises(errors.ASRError) as excinfo:
+        asr.transcribe(tmp_path / "a.wav")
+    assert "模型" in str(excinfo.value)
+    assert excinfo.value.user_hint
+    assert asr.loaded is False
+
+
+# ===========================================================================
+# 单元测试：录音器与 wav 写出
+# ===========================================================================
+def test_recorder_available_never_raises() -> None:
+    assert isinstance(Recorder.available(), bool)
+
+
+def test_list_input_devices_format() -> None:
+    devices = Recorder.list_input_devices()
+    assert isinstance(devices, list)
+    for item in devices:
+        assert isinstance(item, tuple) and len(item) == 2
+        index, name = item
+        assert isinstance(index, int) and index >= 0
+        assert isinstance(name, str) and name
+
+
+def test_recorder_initial_state(tmp_path: Path) -> None:
+    recorder = Recorder(tmp_path / "recordings")
+    assert recorder.is_recording is False
+    assert recorder.elapsed_seconds == 0.0
+    assert recorder.samplerate == SAMPLE_RATE
+    # 没有开始录音时取消是安全的，且可以重复调用
+    recorder.cancel()
+    recorder.cancel()
+    assert recorder.is_recording is False
+
+
+def test_recorder_stop_without_start_raises(tmp_path: Path) -> None:
+    recorder = Recorder(tmp_path / "recordings")
+    with pytest.raises(errors.AudioError) as excinfo:
+        recorder.stop()
+    assert "没有正在进行的录音" in str(excinfo.value)
+    assert excinfo.value.user_hint
+
+
+def test_write_pcm16_wav_header_and_data(tmp_path: Path) -> None:
+    frames = 1600  # 0.1 秒
+    pcm = b"".join(int(index % 1000 * 32).to_bytes(2, "little", signed=True) for index in range(frames))
+    target = tmp_path / "nested" / "录音.wav"
+
+    written = write_pcm16_wav(target, pcm)
+
+    assert written == target and target.is_file()
+    with wave.open(str(target), "rb") as handle:
+        assert handle.getnchannels() == CHANNELS == 1
+        assert handle.getsampwidth() == SAMPLE_WIDTH == 2
+        assert handle.getframerate() == SAMPLE_RATE == 16000
+        assert handle.getnframes() == frames
+        assert handle.readframes(frames) == pcm
+
+
+def test_write_pcm16_wav_empty(tmp_path: Path) -> None:
+    target = write_pcm16_wav(tmp_path / "empty.wav", b"")
+    with wave.open(str(target), "rb") as handle:
+        assert handle.getnframes() == 0
+
+
+def test_write_pcm16_wav_rejects_partial_frame(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="完整采样帧"):
+        write_pcm16_wav(tmp_path / "bad.wav", b"\x00")
+
+
+def test_record_roundtrip_when_microphone_available(tmp_path: Path) -> None:
+    if not Recorder.available():
+        pytest.skip("当前机器没有可用输入设备")
+    recorder = Recorder(tmp_path / "recordings")
+    try:
+        recorder.start()
+    except errors.AudioError as exc:  # 设备被占用等环境问题
+        pytest.skip(f"麦克风不可用：{exc}")
+    try:
+        time.sleep(0.4)
+        assert recorder.is_recording is True
+        assert recorder.elapsed_seconds > 0.0
+        recorded = recorder.stop()
+    except errors.AudioError as exc:  # 没有采到数据（无声卡回环等）
+        recorder.cancel()
+        pytest.skip(f"麦克风未采集到数据：{exc}")
+
+    assert recorded.parent == recorder.recordings_dir
+    assert recorded.suffix == ".wav"
+    with wave.open(str(recorded), "rb") as handle:
+        assert handle.getnchannels() == 1
+        assert handle.getsampwidth() == 2
+        assert handle.getframerate() == recorder.samplerate
+        assert handle.getnframes() > 0
+    assert recorder.is_recording is False
+    assert recorder.elapsed_seconds > 0.0
+
+
+def test_cancel_discards_recording(tmp_path: Path) -> None:
+    if not Recorder.available():
+        pytest.skip("当前机器没有可用输入设备")
+    recorder = Recorder(tmp_path / "recordings")
+    try:
+        recorder.start()
+    except errors.AudioError as exc:
+        pytest.skip(f"麦克风不可用：{exc}")
+    time.sleep(0.2)
+    recorder.cancel()
+    assert recorder.is_recording is False
+    assert recorder.elapsed_seconds == 0.0
+    assert list(recorder.recordings_dir.glob("*.wav")) == []
+    recorder.cancel()  # 幂等
+
+
+def test_recorder_limits() -> None:
+    assert MAX_RECORD_SECONDS == 2 * 60 * 60
+
+
+# ===========================================================================
+# 端到端测试：真实 faster-whisper tiny 模型转写中文 TTS 音频
+# ===========================================================================
+@pytest.mark.skipif(not RUN_ASR, reason="端到端转写需下载 tiny 模型，设置 VOXSCRIBE_RUN_ASR=1 启用")
+def test_e2e_transcribe_tts_audio() -> None:
+    audio = _ensure_tts_audio()
+    E2E_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    asr = WhisperASR(
+        model_size="tiny",
+        compute_type="int8",
+        cpu_threads=4,
+        model_dir=str(E2E_MODEL_DIR),
+        beam_size=5,
+        vad_filter=True,
+    )
+    progress: List[Tuple[float, str]] = []
+    memory_before = _memory_mb()
+    try:
+        transcript = asr.transcribe(
+            audio,
+            language="zh",
+            on_progress=lambda ratio, message: progress.append((ratio, message)),
+        )
+        memory_after = _memory_mb()
+    finally:
+        asr.unload()
+        memory_unloaded = _memory_mb()
+
+    matched = [keyword for keyword in E2E_KEYWORDS if keyword in transcript.text]
+    print(
+        f"\n[e2e] 进程内存：加载前 {memory_before:.1f}MB / "
+        f"加载并转写后 {memory_after:.1f}MB / 卸载后 {memory_unloaded:.1f}MB"
+    )
+    print(f"[e2e] 语言={transcript.language} 音频时长={transcript.duration:.2f}s "
+          f"片段数={len(transcript.segments)} 命中关键词={matched}")
+    print("[e2e] 转写文本：\n" + transcript.text)
+
+    assert transcript.segments, "tiny 模型应识别出至少一个片段"
+    assert transcript.duration > 5.0, f"音频时长异常：{transcript.duration}"
+    assert transcript.language.startswith("zh"), f"语言检测异常：{transcript.language}"
+    assert transcript.text.strip()
+    assert len(matched) >= 2, (
+        f"转写结果命中的关键词不足（{matched}），完整文本：{transcript.text!r}"
+    )
+    # 所有片段文本都已 strip，且纯空白段被丢弃
+    for segment in transcript.segments:
+        assert segment.text == segment.text.strip() and segment.text
+        assert segment.end >= segment.start >= 0.0
+    # 进度回调：0.0 起步、1.0 结束、不越界、消息非空
+    ratios = [ratio for ratio, _ in progress]
+    assert ratios[0] == 0.0 and ratios[-1] == 1.0
+    assert all(0.0 <= ratio <= 1.0 for ratio in ratios)
+    assert all(message for _, message in progress)
+    # 卸载后状态准确，且模型已缓存到本地
+    assert asr.loaded is False
+    assert asr.is_model_available() is True
+
+    print(f"[e2e] 内存净增（模型加载+转写）：{memory_after - memory_before:.1f}MB")
+
+
+@pytest.mark.skipif(not RUN_ASR, reason="端到端转写需下载 tiny 模型，设置 VOXSCRIBE_RUN_ASR=1 启用")
+def test_e2e_cached_model_reloads_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """模型已缓存时，第二次使用完全离线（不再访问 HuggingFace）。"""
+    audio = _ensure_tts_audio()
+    asr = WhisperASR(model_size="tiny", model_dir=str(E2E_MODEL_DIR))
+    if not asr.is_model_available():
+        pytest.skip("tiny 模型尚未缓存，跳过离线复用测试（先跑 test_e2e_transcribe_tts_audio）")
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    try:
+        transcript = asr.transcribe(audio, language="zh")
+    finally:
+        asr.unload()
+    assert transcript.text.strip()
+    assert any(keyword in transcript.text for keyword in E2E_KEYWORDS), (
+        f"离线复用转写结果异常：{transcript.text!r}"
+    )
