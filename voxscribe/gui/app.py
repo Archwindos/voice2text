@@ -40,6 +40,7 @@ from ..config import (
     APP_NAME,
     ASR_MODELS,
     LANGUAGES,
+    PROJECT_ROOT,
     AppSettings,
     default_output_dir,
     recordings_dir,
@@ -337,6 +338,13 @@ class MainWindow:
         self.root.option_add("*tearOff", False)
         try:
             self.root.iconname(APP_NAME)
+        except tk.TclError:  # pragma: no cover
+            pass
+        # 窗口/任务栏图标（与桌面快捷方式使用同一个 ico）
+        icon_path = PROJECT_ROOT / "assets" / "voxscribe.ico"
+        try:
+            if icon_path.exists():
+                self.root.iconbitmap(default=str(icon_path))
         except tk.TclError:  # pragma: no cover
             pass
 

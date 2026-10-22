@@ -1,4 +1,4 @@
-# VoxScribe one-click setup for Windows
+﻿# VoxScribe one-click setup for Windows
 # Creates .venv (Python 3.11), installs dependencies, optionally downloads the ASR model.
 # ASCII-only output so it works in Windows PowerShell 5.1 and PowerShell 7.
 #
@@ -131,11 +131,21 @@ else {
     }
 }
 
+# ---------------------------------------------------------------- 5. shortcut
+Step "Desktop shortcut"
+try {
+    & (Join-Path $Root "tools\create_shortcut.ps1")
+}
+catch {
+    Write-Host "Could not create the desktop shortcut. Run tools\create_shortcut.ps1 later." -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "==============================================="
 Write-Host " Setup complete!" -ForegroundColor Green
-Write-Host " Double-click run.vbs to start (no console window)."
+Write-Host " Start from the desktop shortcut (or run.vbs). No console window."
 Write-Host " Click Settings to fill in your DeepSeek API Key."
 Write-Host " Get a key at https://platform.deepseek.com/"
 Write-Host "==============================================="
 Write-Host ""
+

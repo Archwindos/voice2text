@@ -9,7 +9,7 @@
 设计目标：快、轻量、界面克制、隐私友好；托盘常驻，Alt+~ 一键口述。
 """
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 APP_NAME = "VoxScribe"
 APP_DISPLAY_NAME = "语声成文"
 
@@ -18,3 +18,4 @@ APP_DISPLAY_NAME = "语声成文"
 import os as _os
 
 _os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
