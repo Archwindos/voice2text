@@ -65,7 +65,7 @@ if (-not (Test-Path $VenvPython)) {
 if (-not (Test-Path $VenvPython)) { Fail "Virtual environment was not created." }
 
 # ---------------------------------------------------------------- 2. deps
-Step "Installing dependencies (first run downloads ~250 MB)"
+Step "Installing dependencies (first run downloads ~1.3 GB, including CUDA runtime for GPU)"
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 if ($uv) {
     & uv pip install --python $VenvPython -r requirements.txt
@@ -89,13 +89,23 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "Some dependencies are missing. Run setup.bat again or check the messages above." -ForegroundColor Yellow
 }
 
+Step "GPU check"
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    & nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+    Write-Host "NVIDIA GPU detected. Speech recognition will run on the GPU (CUDA float16)."
+}
+else {
+    Write-Host "No NVIDIA GPU / driver detected. The app will fall back to CPU (slower)." -ForegroundColor Yellow
+    Write-Host "Set asr_device to 'cpu' in data/config.json or the settings file if startup fails."
+}
+
 # ---------------------------------------------------------------- 4. model
 Step "Speech recognition model (optional download)"
 if ($NoModelDownload) {
     Write-Host "Skipped (-NoModelDownload). The model will be downloaded automatically on first transcription."
 }
 else {
-    Write-Host "The 'small' model gives good Chinese accuracy (~484 MB download, ~450 MB RAM while transcribing)."
+    Write-Host "The default 'medium' model gives the best Chinese accuracy on GPU (~1.5 GB download, ~1 GB VRAM while loaded)."
     if ($YesModelDownload) {
         $answer = "y"
     }
@@ -103,16 +113,16 @@ else {
         $answer = Read-Host "Download it now? [Y/n]"
     }
     if ($answer -eq "" -or $answer -match "^[Yy]") {
-        & $VenvPython tools\prefetch_model.py --model small
+        & $VenvPython tools\prefetch_model.py --model medium
         if ($LASTEXITCODE -ne 0) {
             Write-Host "Direct download failed. Retrying through the Hugging Face mirror (hf-mirror.com)..." -ForegroundColor Yellow
             $env:HF_ENDPOINT = "https://hf-mirror.com"
             $env:HF_HUB_DISABLE_XET = "1"
-            & $VenvPython tools\prefetch_model.py --model small
+            & $VenvPython tools\prefetch_model.py --model medium
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "Model download did not finish. It will be retried automatically on first transcription." -ForegroundColor Yellow
                 Write-Host "You can also retry manually later with the mirror:" -ForegroundColor Yellow
-                Write-Host '  $env:HF_ENDPOINT="https://hf-mirror.com"; .venv\Scripts\python.exe tools\prefetch_model.py --model small'
+                Write-Host '  $env:HF_ENDPOINT="https://hf-mirror.com"; .venv\Scripts\python.exe tools\prefetch_model.py --model medium'
             }
         }
     }
@@ -124,8 +134,8 @@ else {
 Write-Host ""
 Write-Host "==============================================="
 Write-Host " Setup complete!" -ForegroundColor Green
-Write-Host " Double-click run.bat to start the app."
-Write-Host " First: click Settings, fill in your DeepSeek API Key."
+Write-Host " Double-click run.vbs to start (no console window)."
+Write-Host " Click Settings to fill in your DeepSeek API Key."
 Write-Host " Get a key at https://platform.deepseek.com/"
 Write-Host "==============================================="
 Write-Host ""

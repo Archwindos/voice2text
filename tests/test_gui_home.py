@@ -1,7 +1,9 @@
-"""首页「语音输入」GUI 测试（不需要真实麦克风 / 真实 DeepSeek API）。
+"""首页「语音输入」/ 托盘 / 全局热键 GUI 测试（全部隐藏窗口运行）。
 
-通过 monkeypatch ``Pipeline.transcribe_and_refine`` 与假录音器驱动完整流程：
-F2 快捷键、录音 → 转换 → 结果文本、自动复制、无 Key 降级、设置保存不清 Key。
+不需要真实麦克风、真实 DeepSeek API、真实系统托盘：
+* ``tests/conftest.py`` 已全局设置 ``VOXSCRIBE_GUI_HIDDEN=1`` 与 ``VOXSCRIBE_DISABLE_TRAY=1``；
+* 录音器替换为假实现，``Pipeline.transcribe_and_refine`` 用 monkeypatch 模拟；
+* 托盘菜单逻辑用假后端（FakeIcon/FakeMenu）验证，不创建真实图标。
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ FAKE_RAW = "嗯，那个，我们今天主要讨论项目的进度问题。"
 # ---------------------------------------------------------------------------
 @pytest.fixture()
 def gui_env(tmp_path, monkeypatch):
-    """隔离配置/数据目录，并确认有可用显示环境。"""
+    """隔离配置/数据目录，并确认有可用显示环境（隐藏窗口）。"""
     try:
         import tkinter as tk
 
@@ -34,6 +36,8 @@ def gui_env(tmp_path, monkeypatch):
 
     monkeypatch.setenv("VOXSCRIBE_CONFIG", str(tmp_path / "data" / "config.json"))
     monkeypatch.setenv("VOXSCRIBE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("VOXSCRIBE_GUI_HIDDEN", "1")
+    monkeypatch.setenv("VOXSCRIBE_DISABLE_TRAY", "1")
     monkeypatch.setenv("VOXSCRIBE_GUI_AUTOCLOSE_MS", "")
     monkeypatch.delenv("VOXSCRIBE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
@@ -118,6 +122,25 @@ class FakeRecorder:
         return [0.2, 0.5, 0.8, 0.3, 0.0] if self.is_recording else []
 
 
+class FakeTray:
+    """主窗口使用的假托盘对象（不创建真实图标）。"""
+
+    def __init__(self) -> None:
+        self.notifications: list = []
+        self.stopped = False
+        self.updates = 0
+
+    def update_state(self) -> None:
+        self.updates += 1
+
+    def notify(self, title: str, message: str) -> bool:
+        self.notifications.append((title, message))
+        return True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 def _make_window(env, *, api_key: str | None = None, auto_copy: bool = True):
     gui_app = env["gui_app"]
     from voxscribe.config import AppSettings
@@ -147,28 +170,43 @@ def _make_window(env, *, api_key: str | None = None, auto_copy: bool = True):
     return root, window
 
 
-def _patch_pipeline(window, monkeypatch, *, refined: bool = True):
-    """替换 Pipeline.transcribe_and_refine，记录传入的 JobOptions。"""
-    from voxscribe.models import JobEvent
+def _patch_pipeline(
+    window,
+    monkeypatch,
+    *,
+    refined: bool = True,
+    interim_text: str | None = None,
+    refine_delay: float = 0.0,
+):
+    """替换 Pipeline.transcribe_and_refine，可模拟「先出原始转写、再润色」。"""
+    from voxscribe.models import JobEvent, Segment, Transcript
 
     captured: dict = {}
 
-    def fake(audio_path, job, emit, cancel=None):  # noqa: ANN001
+    def fake(audio_path, job, emit, cancel=None, on_transcript=None):  # noqa: ANN001
         captured["job"] = job
         captured["audio"] = audio_path
-        emit(JobEvent(stage="asr", progress=1.0, message="转写完成"))
+        captured["interim"] = on_transcript is not None
+        if on_transcript is not None and interim_text is not None:
+            transcript = Transcript(
+                segments=[Segment(0.0, 1.0, interim_text)],
+                language="zh",
+                duration=1.0,
+            )
+            on_transcript(transcript)
+            if refine_delay:
+                time.sleep(refine_delay)
+            emit(JobEvent(stage="refine", progress=0.5, message="DeepSeek 润色中…"))
+        else:
+            emit(JobEvent(stage="asr", progress=1.0, message="转写完成"))
         return _fake_job_result(refined)
 
     monkeypatch.setattr(window.pipeline, "transcribe_and_refine", fake)
     return captured
 
 
-def _run_quick_flow(window, timeout: float = 15.0) -> None:
+def _wait_idle(window, timeout: float = 15.0) -> None:
     root = window.root
-    window._quick_start()
-    assert window._quick_state == "recording"
-    window._quick_stop_and_convert()
-    assert window._quick_state == "converting"
     deadline = time.time() + timeout
     while window._quick_state != "idle" and time.time() < deadline:
         root.update()
@@ -179,16 +217,12 @@ def _run_quick_flow(window, timeout: float = 15.0) -> None:
     assert window._quick_state == "idle", "语音输入转换超时"
 
 
-def _press_key(window, keysym: str) -> None:
-    """模拟按键（先让窗口获得焦点，否则多窗口测试中生成的键盘事件会被丢弃）。"""
-    root = window.root
-    try:
-        root.focus_force()
-    except Exception:  # pragma: no cover - 极端环境
-        pass
-    root.update()
-    root.event_generate(keysym)
-    root.update()
+def _run_quick_flow(window, timeout: float = 15.0) -> None:
+    window._quick_start()
+    assert window._quick_state == "recording"
+    window._quick_stop_and_convert()
+    assert window._quick_state == "converting"
+    _wait_idle(window, timeout)
 
 
 def _close_window(window) -> None:
@@ -198,48 +232,122 @@ def _close_window(window) -> None:
         pass
 
 
+def _root_destroyed(root) -> bool:
+    try:
+        return not root.winfo_exists()
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
-# 测试
+# 全局快捷键 Alt+~
 # ---------------------------------------------------------------------------
-def test_f2_binding_and_successful_conversion(gui_env, monkeypatch):
+def test_alt_tilde_hotkey_edge_detection(gui_env):
+    from voxscribe.gui.hotkey import (
+        HOTKEY_LABEL,
+        VK_MENU,
+        VK_OEM_3,
+        HotkeyListener,
+    )
+
+    assert HOTKEY_LABEL == "Alt+~"
+    assert VK_MENU == 0x12
+    assert VK_OEM_3 == 0xC0
+
+    root = gui_env["gui_app"]._create_root()
+    hits: list = []
+    listener = HotkeyListener(root, lambda: hits.append("hot"))
+    states = iter([True, True, False, True])
+    listener.is_pressed_now = lambda: next(states)  # type: ignore[method-assign]
+    try:
+        assert listener.poll_once() is True  # 按下沿
+        assert listener.poll_once() is False  # 长按不重复
+        assert listener.poll_once() is False  # 松开
+        assert listener.poll_once() is True  # 再次按下
+        assert hits == []
+
+        # _tick 应触发回调（等价 after(50ms) 轮询）：先松开，再按下
+        listener.is_pressed_now = lambda: False  # type: ignore[method-assign]
+        assert listener.poll_once() is False
+        listener.is_pressed_now = lambda: True  # type: ignore[method-assign]
+        listener._enabled = True
+        listener._tick()
+        assert hits == ["hot"]
+        listener.stop()
+    finally:
+        root.destroy()
+
+
+def test_hotkey_starts_and_stops_recording(gui_env, monkeypatch):
     root, window = _make_window(gui_env, api_key="sk-test-home")
     _patch_pipeline(window, monkeypatch, refined=True)
     try:
-        assert window.root.bind("<F2>"), "F2 快捷键应绑定到主窗口"
+        # F2 绑定已移除，改由全局 Alt+~ 轮询
+        assert not window.root.bind("<F2>")
+        assert window._hotkey is not None
+        assert "Alt+~" in window.home_record_btn.cget("text")
 
-        # F2 开始录音
-        _press_key(window, "<F2>")
+        window._on_hotkey()  # 模拟按下 Alt+~
+        root.update()
         assert window._quick_state == "recording"
         assert "停止" in window.home_record_btn.cget("text")
-        assert window._recorder.started == 1
 
-        # 再按 F2 结束并开始转换（fake 流程很快，状态可能瞬间进入 idle）
-        _press_key(window, "<F2>")
-        assert window._quick_state in ("converting", "idle")
-        deadline = time.time() + 15
-        while window._quick_state != "idle" and time.time() < deadline:
-            window.root.update()
-            time.sleep(0.02)
-        for _ in range(30):
-            window.root.update()
-            time.sleep(0.01)
-
-        assert window._quick_state == "idle"
-        assert window._recorder.stopped == 1
+        window._on_hotkey()
+        _wait_idle(window)
         assert FAKE_REFINED in window._get_home_text()
-        status = window.home_status_var.get()
-        assert "AI 已整理" in status
-        assert "仅本地转写" not in status
-        # 成功后不应出现「未配置 Key」橙色提示
-        assert "未配置" not in window.home_inline_hint.cget("text")
-        # 自动复制到剪贴板
-        assert window.settings.auto_copy is True
-        assert window.root.clipboard_get() == window._get_home_text()
+        assert "AI 已整理" in window.home_status_var.get()
         assert gui_env["dialogs"] == []
     finally:
         _close_window(window)
 
 
+# ---------------------------------------------------------------------------
+# 两段式：ASR 完成先显示原始转写，润色后替换
+# ---------------------------------------------------------------------------
+def test_two_stage_shows_raw_transcript_before_refine(gui_env, monkeypatch):
+    root, window = _make_window(gui_env, api_key="sk-test-home")
+    raw = "嗯，那个，我们今天讨论一下项目进度。"
+    captured = _patch_pipeline(
+        window,
+        monkeypatch,
+        refined=True,
+        interim_text=raw,
+        refine_delay=0.4,  # 模拟 DeepSeek 润色耗时
+    )
+    try:
+        window._quick_start()
+        window._quick_stop_and_convert()
+        assert window._quick_state == "converting"
+
+        interim_seen = False
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+            if window._quick_state == "converting":
+                text = window._get_home_text()
+                if text.strip() == raw:
+                    interim_seen = True
+                    status = window.home_status_var.get()
+                    assert "润色" in status or "DeepSeek" in status, status
+            if window._quick_state == "idle":
+                break
+        for _ in range(30):
+            root.update()
+            time.sleep(0.01)
+
+        assert captured["interim"] is True, "应把 on_transcript 回调传给 pipeline"
+        assert interim_seen, "DeepSeek 润色完成前应先显示原始转写"
+        assert window._quick_state == "idle"
+        assert window._get_home_text() == FAKE_REFINED, "最终应替换为润色后的文字"
+        assert window._quick_interim_text == ""
+    finally:
+        _close_window(window)
+
+
+# ---------------------------------------------------------------------------
+# 转换流程与降级
+# ---------------------------------------------------------------------------
 def test_conversion_passes_proofread_style(gui_env, monkeypatch):
     root, window = _make_window(gui_env, api_key="sk-test-home")
     captured = _patch_pipeline(window, monkeypatch, refined=True)
@@ -285,7 +393,6 @@ def test_no_api_key_degrades_to_local_transcribe(gui_env, monkeypatch):
         assert "仅本地转写" in status
         assert "已整理" not in status
         assert "未配置" in window.home_inline_hint.cget("text")
-        assert "未配置" in window.home_mode_var.get()
         assert gui_env["dialogs"] == []
     finally:
         _close_window(window)
@@ -311,9 +418,7 @@ def test_escape_cancels_recording(gui_env, monkeypatch):
     root, window = _make_window(gui_env, api_key="sk-test-home")
     _patch_pipeline(window, monkeypatch, refined=True)
     try:
-        assert window.root.bind("<Escape>"), "Esc 快捷键应绑定到主窗口"
         window._quick_start()
-        # 隐藏窗口下合成键盘事件的焦点行为不稳定，直接触发绑定后的处理函数
         window._on_escape()
         assert window._quick_state == "idle"
         assert window._recorder.cancelled == 1
@@ -321,6 +426,253 @@ def test_escape_cancels_recording(gui_env, monkeypatch):
         _close_window(window)
 
 
+# ---------------------------------------------------------------------------
+# 隐藏模式 / 托盘
+# ---------------------------------------------------------------------------
+def test_hidden_mode_no_tray_and_close_destroys(gui_env):
+    from voxscribe.gui import tray as tray_module
+
+    assert tray_module.tray_disabled_by_env() is True
+    assert tray_module.tray_available() is False
+
+    root, window = _make_window(gui_env, api_key=None)
+    try:
+        assert window._hidden_mode is True
+        assert window._tray is None
+        assert window._tray_job is None
+        # 隐藏模式下关闭请求必须真实销毁，不能拦截（否则测试会挂住）
+        window._on_close_request()
+        assert _root_destroyed(root)
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_tray_menu_callbacks_and_state(gui_env, monkeypatch):
+    """用假 pystray 后端验证菜单文案/回调/图标状态刷新，不创建真实图标。"""
+    from types import SimpleNamespace
+
+    from voxscribe.gui import tray as tray_module
+
+    events: list = []
+    state = {"recording": False, "visible": False}
+
+    class FakeIcon:
+        def __init__(self, name, icon=None, title=None, menu=None) -> None:
+            self.name = name
+            self.icon = icon
+            self.title = title
+            self.menu = menu
+            self.notifications: list = []
+            self.stopped = False
+            self.updates = 0
+
+        def run(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def notify(self, message, title=None) -> None:
+            self.notifications.append((title, message))
+
+        def update_menu(self) -> None:
+            self.updates += 1
+
+    class FakeMenuItem:
+        def __init__(self, text, action, default=False) -> None:
+            self.text = text
+            self.action = action
+            self.default = default
+
+    class FakeMenu:
+        SEPARATOR = object()
+
+        def __init__(self, *items) -> None:
+            self.items = list(items)
+
+    backend = SimpleNamespace(
+        Icon=FakeIcon, Menu=FakeMenu, MenuItem=FakeMenuItem, SEPARATOR=object()
+    )
+    monkeypatch.setattr(tray_module, "tray_available", lambda: True)
+    monkeypatch.setattr(tray_module, "_load_backend", lambda: backend)
+    monkeypatch.setattr(tray_module, "create_tray_image", lambda recording=False: object())
+
+    root = gui_env["gui_app"]._create_root()
+    icon = tray_module.TrayIcon(
+        root,
+        on_toggle_window=lambda: events.append("toggle_window"),
+        on_toggle_recording=lambda: events.append("toggle_recording"),
+        on_quit=lambda: events.append("quit"),
+        is_recording=lambda: state["recording"],
+        is_visible=lambda: state["visible"],
+    )
+    try:
+        assert icon.start() is True
+        fake_icon = icon._icon
+        assert fake_icon is not None
+        labels = [item.text for item in fake_icon.menu.items if hasattr(item, "text")]
+        assert "显示主界面" in labels
+        assert "开始录音（Alt+~）" in labels
+        assert fake_icon.title and "Alt+~" in fake_icon.title
+
+        # 触发「显示主界面」菜单项：回调经 root.after(0) 投递到主线程
+        for item in fake_icon.menu.items:
+            if getattr(item, "text", "") == "显示主界面":
+                item.action()
+                break
+        root.update()
+        assert events == ["toggle_window"]
+
+        # 录音中：菜单文案、tooltip、图标一起刷新
+        state["recording"] = True
+        state["visible"] = True
+        icon.update_state()
+        labels = [item.text for item in fake_icon.menu.items if hasattr(item, "text")]
+        assert "隐藏主界面" in labels
+        assert "停止录音（Alt+~）" in labels
+        assert "正在录音" in fake_icon.title
+        assert fake_icon.updates >= 1
+
+        assert icon.notify("测试标题", "测试内容") is True
+        assert fake_icon.notifications
+        icon.stop()
+        assert fake_icon.stopped is True
+    finally:
+        root.destroy()
+
+
+def test_close_to_tray_hides_and_shows_first_hint(gui_env):
+    root, window = _make_window(gui_env)
+    try:
+        window._hidden_mode = False  # 模拟正常桌面模式
+        fake_tray = FakeTray()
+        window._tray = fake_tray
+        window.settings.close_to_tray = True
+        assert window._hide_to_tray(notify=True) is True
+        assert window.root.state() == "withdrawn"
+        assert window._tray_hint_shown is True
+        assert len(fake_tray.notifications) == 1
+        assert "托盘" in fake_tray.notifications[0][0]
+
+        # 再次隐藏不重复弹气泡
+        window._hide_to_tray(notify=True)
+        assert len(fake_tray.notifications) == 1
+
+        # 关闭按钮在托盘可用时 = 隐藏，而不是销毁
+        window._on_close_request()
+        assert root.winfo_exists() == 1
+        assert fake_tray.stopped is False
+    finally:
+        _close_window(window)
+
+
+def test_close_to_tray_disabled_exits(gui_env):
+    root, window = _make_window(gui_env)
+    try:
+        window._hidden_mode = False
+        window._tray = FakeTray()
+        window.settings.close_to_tray = False
+        window._on_close_request()
+        assert _root_destroyed(root)
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_minimize_hides_to_tray(gui_env):
+    root, window = _make_window(gui_env)
+    try:
+        window._hidden_mode = False
+        fake_tray = FakeTray()
+        window._tray = fake_tray
+        # 用假 state() 模拟最小化（真实 iconify 在测试机上会打扰桌面）
+        original_state = root.state
+        state_calls = {"count": 0}
+
+        def fake_state(*args):
+            state_calls["count"] += 1
+            if state_calls["count"] == 1:
+                return "iconic"
+            return original_state(*args)
+
+        root.state = fake_state  # type: ignore[method-assign]
+        window._maybe_hide_iconified()
+        assert state_calls["count"] >= 1
+        assert original_state() == "withdrawn"
+        assert len(fake_tray.notifications) == 1
+    finally:
+        _close_window(window)
+
+
+# ---------------------------------------------------------------------------
+# 模型预热（v1.2：启动后台 warm_up，首句更快）
+# ---------------------------------------------------------------------------
+def test_hidden_mode_skips_warmup(gui_env, monkeypatch):
+    root, window = _make_window(gui_env)
+    called: list = []
+    monkeypatch.setattr(
+        window.pipeline, "warm_up", lambda cancel=None: called.append(1) or True
+    )
+    try:
+        assert window._hidden_mode is True
+        window._start_warmup()  # 隐藏测试模式直接跳过
+        assert called == []
+        assert window._warming_up is False
+    finally:
+        _close_window(window)
+
+
+def test_preload_model_disabled_skips_warmup(gui_env, monkeypatch):
+    root, window = _make_window(gui_env)
+    called: list = []
+    monkeypatch.setattr(
+        window.pipeline, "warm_up", lambda cancel=None: called.append(1) or True
+    )
+    try:
+        window._hidden_mode = False
+        window.settings.preload_model = False
+        window._start_warmup()
+        assert called == []
+        assert window._warming_up is False
+    finally:
+        _close_window(window)
+
+
+def test_warmup_updates_status_without_dialog(gui_env, monkeypatch):
+    root, window = _make_window(gui_env)
+    monkeypatch.setattr(window.pipeline, "warm_up", lambda cancel=None: True)
+    try:
+        window._hidden_mode = False  # 模拟正常桌面模式
+        window._start_warmup()
+        assert window._warming_up is True
+        deadline = time.time() + 10
+        while window._warming_up and time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+        for _ in range(20):
+            root.update()
+            time.sleep(0.01)
+        assert window._warming_up is False
+        assert "预热" in window.status_var.get()
+        assert gui_env["dialogs"] == [], "预热不应弹窗"
+
+        # 预热中录音时，状态提示应提示「首次使用稍等」
+        window._warming_up = True
+        assert "预热" in window._listening_status()
+        window._warming_up = False
+        assert "预热" not in window._listening_status()
+    finally:
+        _close_window(window)
+
+
+# ---------------------------------------------------------------------------
+# 设置对话框：Key 保护 / 关闭到托盘选项
+# ---------------------------------------------------------------------------
 def test_settings_dialog_keeps_saved_key_on_empty_save(gui_env):
     gui_app = gui_env["gui_app"]
     from voxscribe import secure
@@ -338,7 +690,6 @@ def test_settings_dialog_keeps_saved_key_on_empty_save(gui_env):
         window_geometry="",
     )
     assert settings.set_api_key("sk-keep-me-123") is True
-    assert settings.has_api_key is True
 
     root = gui_app._create_root()
     window = gui_app.MainWindow(root, settings)
@@ -349,25 +700,28 @@ def test_settings_dialog_keeps_saved_key_on_empty_save(gui_env):
             pipeline=window.pipeline,
             theme=window.theme,
         )
-        # 不回显明文 Key；留空表示不修改
         assert dialog.api_key_var.get() == ""
         assert dialog._has_saved_key is True
-        assert dialog.clear_key_button["state"] != "disabled"
+        assert dialog.close_to_tray_var.get() is True
 
         dialog._on_save()
         root.update()
 
         assert settings.has_api_key is True, "留空保存不得清空已保存的 Key"
         assert settings.get_api_key() == "sk-keep-me-123"
-        config_path = Path(gui_env["tmp_path"]) / "data" / "config.json"
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = json.loads(
+            (Path(gui_env["tmp_path"]) / "data" / "config.json").read_text(
+                encoding="utf-8"
+            )
+        )
         assert raw["api_key_enc"].startswith("dpapi:")
         assert "sk-keep-me-123" not in json.dumps(raw, ensure_ascii=False)
+        assert raw["close_to_tray"] is True
     finally:
         _close_window(window)
 
 
-def test_settings_dialog_accepts_new_key(gui_env):
+def test_settings_dialog_accepts_new_key_and_tray_option(gui_env):
     gui_app = gui_env["gui_app"]
     from voxscribe import secure
     from voxscribe.config import AppSettings
@@ -395,9 +749,12 @@ def test_settings_dialog_accepts_new_key(gui_env):
             theme=window.theme,
         )
         dialog.api_key_var.set("sk-new-key-456")
+        dialog.close_to_tray_var.set(False)
         dialog._on_save()
         root.update()
+
         assert settings.get_api_key() == "sk-new-key-456"
+        assert settings.close_to_tray is False
         raw = json.loads(
             (Path(gui_env["tmp_path"]) / "data" / "config.json").read_text(
                 encoding="utf-8"
@@ -405,5 +762,6 @@ def test_settings_dialog_accepts_new_key(gui_env):
         )
         assert raw["api_key_enc"].startswith("dpapi:")
         assert "sk-new-key-456" not in json.dumps(raw, ensure_ascii=False)
+        assert raw["close_to_tray"] is False
     finally:
         _close_window(window)

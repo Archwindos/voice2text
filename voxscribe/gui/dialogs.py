@@ -14,6 +14,7 @@ from typing import Callable, Optional, Tuple
 from ..config import AppSettings, default_output_dir
 from ..errors import VoxError
 from ..pipeline import Pipeline
+from .hotkey import HOTKEY_LABEL
 from .theme import (
     COLORS,
     SMALL_SIZE,
@@ -264,9 +265,18 @@ class SettingsDialog(tk.Toplevel):
             "线程数 0 = 自动（最多 4 线程，尽量不抢满 CPU）；"
             "空闲卸载分钟数 0 = 不卸载，默认 5 分钟空闲后释放识别模型内存。"
         )
+        self.close_to_tray_var = tk.BooleanVar(
+            value=bool(getattr(self.settings, "close_to_tray", True))
+        )
+        ttk.Checkbutton(
+            perf_body,
+            text="关闭/最小化窗口时隐藏到系统托盘，后台待机",
+            variable=self.close_to_tray_var,
+            style="Card.TCheckbutton",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(theme.px(8), 0))
         _card_label(
             perf_body, theme, perf_hint, muted=True, wraplength=theme.px(500)
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(theme.px(4), 0))
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(theme.px(4), 0))
 
         # --- 术语表 ---
         glossary_card, glossary_body = make_card(outer, theme, "术语表（可选）")
@@ -356,6 +366,7 @@ class SettingsDialog(tk.Toplevel):
             if settings.output_dir.strip()
             else str(default_output_dir())
         )
+        self.close_to_tray_var.set(bool(getattr(settings, "close_to_tray", True)))
         if settings.glossary:
             self.glossary_text.delete("1.0", "end")
             self.glossary_text.insert("1.0", settings.glossary)
@@ -553,6 +564,7 @@ class SettingsDialog(tk.Toplevel):
         self.settings.api_model = model
         self.settings.cpu_threads = threads
         self.settings.idle_unload_minutes = idle_minutes
+        self.settings.close_to_tray = bool(self.close_to_tray_var.get())
         self.settings.glossary = self.glossary_text.get("1.0", "end-1c").strip()
         self.settings.output_dir = str(output_path) if output_path else ""
 
@@ -652,7 +664,8 @@ class WelcomeDialog(tk.Toplevel):
         bullets = [
             (
                 "点一下，说话就变成文字",
-                "点大按钮或按 F2 开始说话，再按一次结束；几秒后自动得到整理好的文字，不用打字。",
+                f"点大按钮或按 {HOTKEY_LABEL} 开始说话，再按一次结束；"
+                "几秒后自动得到整理好的文字，不用打字。",
             ),
             (
                 "本地转写 + DeepSeek 纠错",
@@ -695,8 +708,8 @@ class WelcomeDialog(tk.Toplevel):
             ).pack(fill="x")
 
         note = (
-            "还没有 API Key？可以先体验本地转写：按 F2 说一段，文字会直接出现在首页；"
-            "稍后在「设置」中补充 Key 即可启用 AI 纠错整理。"
+            f"还没有 API Key？可以先体验本地转写：按 {HOTKEY_LABEL} 说一段，"
+            "文字会直接出现在首页；稍后在「设置」中补充 Key 即可启用 AI 纠错整理。"
         )
         tk.Label(
             outer,
@@ -756,20 +769,22 @@ class WelcomeDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 # 帮助
 # ---------------------------------------------------------------------------
-_HELP_TEXT = """语音输入：说一句，立刻成文（推荐）
+_HELP_TEXT = f"""语音输入：说一句，立刻成文（推荐）
 
 1. 开始说话
-   点击首页的大按钮「● 开始录音」，或直接按 F2，对着麦克风正常说话。
+   点击首页的大按钮「● 开始录音」，或直接按 {HOTKEY_LABEL}，对着麦克风正常说话。
+   快捷键是全局的：窗口在后台、最小化到托盘时也能用。
    录音时波形会实时跳动，顶部显示录音时长，说明麦克风工作正常。
 
 2. 再按一次结束
-   说完后再按一次 F2（或点击「■ 停止并转换」）。
+   说完后再按一次 {HOTKEY_LABEL}（或点击「■ 停止并转换」）。
    程序会自动：本地语音转写 → DeepSeek「口述校对」（纠错别字、去口头禅、补标点）。
+   转写一完成就会先把原始文字显示出来，再等 DeepSeek 润色后原地替换，等待感更小。
 
 3. 得到文字
    几秒后文字出现在首页下方，可以直接修改。
    点「复制文字」或按 Ctrl+Enter 复制，默认会「完成后自动复制到剪贴板」。
-   快捷键：F2 开始/结束录音；录音中按 Esc = 丢弃本次录音；转换中按 Esc = 取消转换。
+   快捷键：{HOTKEY_LABEL} 开始/结束录音；录音中按 Esc = 丢弃本次录音；转换中按 Esc = 取消转换。
 
 文件转写：处理已有的音频 / 视频
 
@@ -777,6 +792,12 @@ _HELP_TEXT = """语音输入：说一句，立刻成文（推荐）
 · 选择整理风格（口述成文 / 会议纪要 / 逐字稿润色 / 要点摘要）、音频语言、识别模型和导出格式。
 · 点击「开始处理」，程序会依次完成：语音转写 → DeepSeek 整理 → 导出文件。
 · 导出支持 txt / md / docx / srt，默认保存到程序目录下的 outputs/ 文件夹。
+
+系统托盘常驻
+
+· 点窗口的关闭按钮或最小化窗口，默认会隐藏到系统托盘待机（可在设置中关闭）。
+· 隐藏后按 {HOTKEY_LABEL} 仍然可以开始录音；双击托盘图标恢复窗口，右键托盘图标可退出。
+· 托盘菜单同样提供「显示/隐藏主界面」「开始/停止录音」「退出」。
 
 轻量说明
 

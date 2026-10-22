@@ -19,6 +19,11 @@
       $env:HF_HUB_DISABLE_XET = '1'
 
   模型下载到 ``data/models`` 后，后续运行（以及 App 本身）完全离线可用。
+
+  GPU 相关用例默认跳过，需要显式开启（要求本机有可用 NVIDIA GPU）：
+
+      $env:VOXSCRIBE_RUN_GPU = '1'
+      & .\\.venv\\Scripts\\python.exe -m pytest tests/test_asr.py -q
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -36,8 +42,19 @@ from typing import List, Tuple
 
 import pytest
 
+from voxscribe import asr as asr_module
 from voxscribe import errors
-from voxscribe.asr import MODEL_SIZE_HINTS, ZH_INITIAL_PROMPT, WhisperASR
+from voxscribe.asr import (
+    MODEL_SIZE_HINTS,
+    ZH_INITIAL_PROMPT,
+    WhisperASR,
+    ensure_cuda_dll_directories,
+    find_cuda_dll_directories,
+    get_cuda_compute_types,
+    get_cuda_device_count,
+    is_cuda_device,
+    resolve_compute_type,
+)
 from voxscribe.config import ASR_MODELS
 from voxscribe.recorder import (
     CHANNELS,
@@ -56,6 +73,8 @@ FIXTURE_AUDIO = PROJECT_ROOT / "tests" / "fixtures" / "tts_zh.wav"
 MAKE_AUDIO_SCRIPT = PROJECT_ROOT / "tools" / "make_test_audio.ps1"
 E2E_MODEL_DIR = PROJECT_ROOT / "data" / "models"
 RUN_ASR = os.environ.get("VOXSCRIBE_RUN_ASR") == "1"
+#: GPU 重载/真实转写用例默认跳过，避免在无 GPU 环境失败
+RUN_GPU = os.environ.get("VOXSCRIBE_RUN_GPU") == "1"
 #: 端到端断言用的关键词：TTS 文本「项目 / 进度 / 前端 / 后端 / 百分之七十 / 两周」。
 #: 同时收纳繁体写法，避免不同模型版本输出繁体时误判失败。
 E2E_KEYWORDS = (
@@ -200,6 +219,14 @@ def _memory_mb() -> float:
     except Exception:  # pragma: no cover - 兜底实现失败时不阻塞测试
         pass
     return 0.0
+
+
+def _cuda_available() -> bool:
+    """当前机器是否有可用的 CUDA GPU（ctranslate2 视角）。"""
+    try:
+        return get_cuda_device_count() > 0 and "float16" in get_cuda_compute_types()
+    except Exception:  # pragma: no cover - 环境异常
+        return False
 
 
 def _pcm16_sine(
@@ -804,6 +831,156 @@ def test_recent_levels_with_real_microphone(tmp_path: Path) -> None:
 
 
 # ===========================================================================
+# v1.2 GPU 支持：compute_type 解析 / CUDA DLL 目录 / 中文错误提示
+# ===========================================================================
+def test_is_cuda_device() -> None:
+    assert is_cuda_device("cuda") is True
+    assert is_cuda_device("CUDA") is True
+    assert is_cuda_device("cuda:0") is True
+    assert is_cuda_device(" cuda ") is True
+    assert is_cuda_device("cpu") is False
+    assert is_cuda_device(None) is False
+    assert is_cuda_device("") is False
+
+
+@pytest.mark.parametrize(
+    ("device", "requested", "expected"),
+    [
+        ("cuda", "auto", "float16"),
+        ("cuda", "", "float16"),
+        ("cuda", None, "float16"),
+        ("cuda", "AUTO", "float16"),
+        ("cuda:0", "auto", "float16"),
+        ("cpu", "auto", "int8"),
+        ("cpu", "", "int8"),
+        ("cpu", None, "int8"),
+        ("cuda", "int8_float16", "int8_float16"),  # 显式值原样保留
+        ("cuda", "int8", "int8"),
+        ("cpu", "float32", "float32"),
+        ("cpu", "int8", "int8"),
+    ],
+)
+def test_resolve_compute_type(device: str, requested, expected: str) -> None:
+    assert resolve_compute_type(device, requested) == expected
+
+
+def test_whisper_asr_compute_type_auto_by_device() -> None:
+    assert WhisperASR(device="cpu").compute_type == "int8"
+    assert WhisperASR(device="cuda").compute_type == "float16"
+    assert WhisperASR(device="cuda", compute_type="auto").compute_type == "float16"
+    assert (
+        WhisperASR(device="cuda", compute_type="int8_float16").compute_type
+        == "int8_float16"
+    )
+
+
+def test_find_cuda_dll_directories_from_fake_site(tmp_path: Path) -> None:
+    site_root = tmp_path / "site-packages"
+    for component in ("cublas", "cudnn", "cuda_runtime"):
+        (site_root / "nvidia" / component / "bin").mkdir(parents=True)
+    (site_root / "nvidia" / "cublas" / "lib").mkdir()  # Linux 布局也应识别
+    (site_root / "not_nvidia").mkdir()
+
+    directories = find_cuda_dll_directories([site_root])
+
+    relative = [f"{path.parent.name}/{path.name}" for path in directories]
+    assert relative == [
+        "cublas/bin",
+        "cublas/lib",
+        "cuda_runtime/bin",
+        "cudnn/bin",
+    ]
+    for path in directories:
+        assert path.is_dir()
+
+
+def test_find_cuda_dll_directories_without_nvidia(tmp_path: Path) -> None:
+    site_root = tmp_path / "site-packages"
+    (site_root / "faster_whisper").mkdir(parents=True)
+    assert find_cuda_dll_directories([site_root]) == []
+    assert find_cuda_dll_directories([tmp_path / "不存在"]) == []
+
+
+def test_ensure_cuda_dll_directories_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if sys.platform != "win32":
+        pytest.skip("os.add_dll_directory / PATH 注入仅在 Windows 生效")
+    site_root = tmp_path / "site-packages"
+    for component in ("cublas", "cudnn"):
+        (site_root / "nvidia" / component / "bin").mkdir(parents=True)
+
+    # 隔离模块级全局状态，并确保 PATH 在测试结束后恢复
+    monkeypatch.setattr(asr_module, "_CONFIGURED_DLL_DIRS", set())
+    monkeypatch.setattr(asr_module, "_DLL_DIR_HANDLES", [])
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+
+    first = ensure_cuda_dll_directories([site_root])
+    assert len(first) == 2
+    handles_after_first = len(asr_module._DLL_DIR_HANDLES)
+    assert handles_after_first == len(first)
+    path_after_first = os.environ["PATH"]
+    for directory in first:
+        assert path_after_first.split(os.pathsep).count(str(directory)) == 1
+
+    # 幂等：重复调用不重复注册 DLL 目录、不再改 PATH
+    second = ensure_cuda_dll_directories([site_root])
+    assert second == first
+    assert len(asr_module._DLL_DIR_HANDLES) == handles_after_first
+    assert os.environ["PATH"] == path_after_first
+
+
+def test_prepare_cuda_environment_without_gpu_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asr = WhisperASR(device="cuda")
+    monkeypatch.setattr(asr_module, "ensure_cuda_dll_directories", lambda *args, **kwargs: [])
+    monkeypatch.setattr(asr_module, "get_cuda_device_count", lambda: 0)
+    with pytest.raises(errors.ASRError) as excinfo:
+        asr._prepare_cuda_environment()
+    assert "GPU" in str(excinfo.value)
+    assert "asr_device=cpu" in excinfo.value.user_hint
+
+
+def test_prepare_cuda_environment_rejects_unsupported_compute_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asr = WhisperASR(device="cuda", compute_type="int8")
+    monkeypatch.setattr(asr_module, "ensure_cuda_dll_directories", lambda *args, **kwargs: [])
+    monkeypatch.setattr(asr_module, "get_cuda_device_count", lambda: 1)
+    monkeypatch.setattr(asr_module, "get_cuda_compute_types", lambda: {"float16"})
+    monkeypatch.setattr(asr_module, "get_gpu_name", lambda: "Fake GPU")
+    with pytest.raises(errors.ASRError) as excinfo:
+        asr._prepare_cuda_environment()
+    assert "compute_type" in str(excinfo.value)
+    assert "asr_device=cpu" in excinfo.value.user_hint
+
+
+def test_cuda_error_messages_are_chinese_and_actionable() -> None:
+    asr = WhisperASR(device="cuda")
+    message = "Library cublas64_12.dll is not found or cannot be loaded"
+
+    load_error = asr._wrap_load_error(RuntimeError(message), needs_download=False)  # noqa: SLF001
+    assert isinstance(load_error, errors.ASRError)
+    assert "GPU" in str(load_error)
+    assert "asr_device=cpu" in load_error.user_hint
+
+    transcribe_error = asr._wrap_transcribe_error(  # noqa: SLF001
+        RuntimeError(message), Path("a.wav")
+    )
+    assert isinstance(transcribe_error, errors.ASRError)
+    assert "GPU" in str(transcribe_error)
+    assert "asr_device=cpu" in transcribe_error.user_hint
+
+    # CPU 设备的普通模型错误不应被误判成 GPU 错误
+    cpu_asr = WhisperASR(device="cpu")
+    cpu_error = cpu_asr._wrap_load_error(  # noqa: SLF001
+        RuntimeError("some unknown failure"), needs_download=False
+    )
+    assert "GPU" not in str(cpu_error)
+
+
+# ===========================================================================
 # 端到端测试：真实 faster-whisper tiny 模型转写中文 TTS 音频
 # ===========================================================================
 @pytest.mark.skipif(not RUN_ASR, reason="端到端转写需下载 tiny 模型，设置 VOXSCRIBE_RUN_ASR=1 启用")
@@ -882,3 +1059,56 @@ def test_e2e_cached_model_reloads_offline(monkeypatch: pytest.MonkeyPatch) -> No
     assert any(keyword in transcript.text for keyword in E2E_KEYWORDS), (
         f"离线复用转写结果异常：{transcript.text!r}"
     )
+
+
+@pytest.mark.skipif(
+    not RUN_GPU, reason="GPU 端到端测试需本机 NVIDIA GPU，设置 VOXSCRIBE_RUN_GPU=1 启用"
+)
+def test_e2e_gpu_transcribe_and_model_reuse() -> None:
+    """真实 GPU 转写：device=cuda / float16，同一实例第二次转写不重载模型。"""
+    if not _cuda_available():
+        pytest.skip("当前环境没有可用的 CUDA GPU（ctranslate2 未检测到）")
+    audio = _ensure_tts_audio()
+
+    asr = WhisperASR(
+        model_size="tiny",
+        device="cuda",
+        compute_type="auto",
+        model_dir=str(E2E_MODEL_DIR),
+    )
+    # 构造阶段就应解析出 float16，且不会静默回退 CPU
+    assert asr.compute_type == "float16"
+    assert asr.device == "cuda"
+    assert asr.is_model_available(), "tiny 模型应已缓存到 data/models（先跑 ASR e2e）"
+
+    try:
+        started = time.monotonic()
+        transcript = asr.transcribe(audio, language="zh")
+        first_elapsed = time.monotonic() - started
+        assert asr.loaded is True
+        model_reference = asr._model  # noqa: SLF001
+
+        assert transcript.text.strip()
+        matched = [keyword for keyword in E2E_KEYWORDS if keyword in transcript.text]
+        assert len(matched) >= 2, f"GPU 转写结果异常：{transcript.text!r}"
+
+        started = time.monotonic()
+        transcript_second = asr.transcribe(audio, language="zh")
+        second_elapsed = time.monotonic() - started
+        # 同一实例连续第二次转写：复用同一个模型对象，不重新加载
+        assert asr._model is model_reference  # noqa: SLF001
+        assert asr.loaded is True
+        assert transcript_second.text.strip()
+        assert second_elapsed < first_elapsed, (
+            f"第二次转写应省去模型加载时间：first={first_elapsed:.2f}s "
+            f"second={second_elapsed:.2f}s"
+        )
+        print(
+            f"\n[GPU] tiny 首次（含加载）={first_elapsed:.2f}s，"
+            f"第二次（纯转写）={second_elapsed:.2f}s，"
+            f"compute_type={asr.compute_type}"
+        )
+        print("[GPU] 转写文本：\n" + transcript.text)
+    finally:
+        asr.unload()
+    assert asr.loaded is False

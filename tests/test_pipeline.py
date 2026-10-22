@@ -30,6 +30,7 @@ class FakeASR:
         self.fail = fail
         self.unloaded = False
         self.last_language: Optional[str] = None
+        self.ensured_loaded = 0
 
     @property
     def loaded(self) -> bool:
@@ -40,6 +41,11 @@ class FakeASR:
 
     def model_size_hint(self) -> str:
         return "1MB"
+
+    def ensure_loaded(self, on_progress=None, cancel=None) -> None:
+        self.ensured_loaded += 1
+        if self.fail:
+            raise self.fail
 
     def transcribe(self, audio_path, *, language="zh", on_progress=None, cancel=None):
         if on_progress:
@@ -169,7 +175,7 @@ def test_run_with_refine(tmp_path: Path, fake_export) -> None:
 
 
 def test_transcribe_and_refine_without_export(tmp_path: Path, monkeypatch) -> None:
-    """快速语音输入入口：只转写+整理，不写文件。"""
+    """快速语音输入入口：只转写+整理，不写文件；原始转写可先回调。"""
     settings = _settings(tmp_path)
     asr = FakeASR()
     refiner = FakeRefiner()
@@ -181,9 +187,13 @@ def test_transcribe_and_refine_without_export(tmp_path: Path, monkeypatch) -> No
         lambda *args, **kwargs: export_calls.append(1) or [],
     )
     events, emit = _collect()
+    callback_texts = []
 
     result = pipe.transcribe_and_refine(
-        _audio(tmp_path), JobOptions(refine=True, style="proofread"), emit
+        _audio(tmp_path),
+        JobOptions(refine=True, style="proofread"),
+        emit,
+        on_transcript=lambda transcript: callback_texts.append(transcript.text),
     )
 
     assert export_calls == []
@@ -192,7 +202,26 @@ def test_transcribe_and_refine_without_export(tmp_path: Path, monkeypatch) -> No
     assert result.elapsed >= 0
     assert events[-1].stage == "done"
     assert "转换完成" in events[-1].message
+    assert callback_texts == ["嗯，那个，我们讨论一下项目进度。"]
     assert pipe.busy is False
+
+
+def test_on_transcript_callback_errors_are_ignored(tmp_path: Path) -> None:
+    """界面的显示回调出错不应中断转换。"""
+    settings = _settings(tmp_path)
+    pipe = _make_pipeline(settings, FakeASR(), FakeRefiner())
+    events, emit = _collect()
+
+    def broken(_transcript):
+        raise RuntimeError("ui callback boom")
+
+    result = pipe.transcribe_and_refine(
+        _audio(tmp_path),
+        JobOptions(refine=True, style="proofread"),
+        emit,
+        on_transcript=broken,
+    )
+    assert result.final_text == "我们讨论一下项目进度。"
 
 
 def test_missing_api_key_raises(tmp_path: Path, fake_export, monkeypatch) -> None:
@@ -268,6 +297,19 @@ def test_idle_unload(tmp_path: Path, fake_export) -> None:
     assert pipe.maybe_unload_idle() is True
     assert asr.unloaded is True
     assert pipe.maybe_unload_idle() is False
+
+
+def test_warm_up_loads_model_and_reports_failure(tmp_path: Path) -> None:
+    """启动预热：成功返回 True；失败只返回 False，不抛异常。"""
+    settings = _settings(tmp_path)
+    asr = FakeASR()
+    pipe = _make_pipeline(settings, asr)
+    assert pipe.warm_up() is True
+    assert asr.ensured_loaded == 1
+
+    broken = FakeASR(fail=errors.ASRError("GPU 不可用"))
+    pipe2 = _make_pipeline(settings, broken)
+    assert pipe2.warm_up() is False
 
 
 def test_apply_settings_reloads_asr(tmp_path: Path, fake_export) -> None:

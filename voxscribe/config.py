@@ -75,17 +75,18 @@ def default_output_dir() -> Path:
 class AppSettings:
     """全部可持久化设置。字段名即 config.json 的键名。"""
 
-    # --- 语音识别（本地 faster-whisper）---
-    asr_model: str = "small"
-    compute_type: str = "int8"
-    cpu_threads: int = 0  # 0 = 自动（最多 4 线程，保证不抢满 CPU）
+    # --- 语音识别（本地 faster-whisper，优先 GPU）---
+    asr_model: str = "medium"
+    asr_device: str = "cuda"  # cuda / cpu；用户要求默认走 GPU
+    compute_type: str = "auto"  # auto = cuda→float16 / cpu→int8
+    cpu_threads: int = 0  # 仅 CPU 模式使用；0 = 自动（最多 4 线程）
     language: str = "zh"  # zh / en / ja / ko / auto
     beam_size: int = 5
     vad_filter: bool = True
     model_dir: str = ""  # 空 = data/models
-    idle_unload_minutes: int = 5  # 空闲多少分钟后卸载模型释放内存；0 = 不卸载
+    idle_unload_minutes: int = 0  # 0 = 常驻不卸载（保证口述响应速度）
 
-    # --- DeepSeek 文本整理 ---
+    # --- DeepSeek 文本整理（deepseek-chat，非思考模式，低延迟）---
     api_base_url: str = "https://api.deepseek.com"
     api_model: str = "deepseek-chat"
     api_timeout: int = 120
@@ -103,6 +104,8 @@ class AppSettings:
     # --- 界面 ---
     window_geometry: str = ""
     first_run_done: bool = False
+    close_to_tray: bool = True  # 点关闭/最小化时隐藏到系统托盘待机
+    preload_model: bool = True  # 启动时后台预热识别模型，保证首句口述也够快
 
     # ------------------------------------------------------------------
     # 读写
@@ -203,6 +206,18 @@ class AppSettings:
         if self.cpu_threads and self.cpu_threads > 0:
             return max(1, min(int(self.cpu_threads), cpu_count))
         return max(1, min(4, cpu_count - 1))
+
+    def effective_device(self) -> str:
+        """识别设备：cuda / cpu（默认 GPU）。"""
+        value = (self.asr_device or "").strip().lower()
+        return "cuda" if value in ("cuda", "gpu", "auto", "") else "cpu"
+
+    def effective_compute_type(self) -> str:
+        """计算精度：auto 时 GPU 用 float16、CPU 用 int8。"""
+        requested = (self.compute_type or "").strip().lower()
+        if requested in ("", "auto"):
+            return "float16" if self.effective_device() == "cuda" else "int8"
+        return requested
 
     def resolve_model_dir(self) -> Path:
         return Path(self.model_dir).expanduser() if self.model_dir.strip() else models_dir()

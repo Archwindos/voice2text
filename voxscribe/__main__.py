@@ -194,6 +194,22 @@ def run_check() -> int:
     key = settings.get_api_key()
     print(f"  DeepSeek API Key : {'已配置' if key else '未配置（仅可转写，无法 AI 整理）'}")
     print(f"  DeepSeek 模型    : {settings.api_model} @ {settings.api_base_url}")
+    print(
+        f"  识别设备/精度    : {settings.effective_device()} / "
+        f"{settings.effective_compute_type()}"
+    )
+    try:
+        import ctranslate2  # noqa: PLC0415
+
+        cuda_count = int(ctranslate2.get_cuda_device_count())
+        print(f"  CUDA 设备数量    : {cuda_count}")
+        if settings.effective_device() == "cuda" and cuda_count == 0:
+            print(
+                "  [警告] 配置为 GPU 转写，但未检测到可用 CUDA 设备；"
+                "可在 data/config.json 把 asr_device 改为 cpu。"
+            )
+    except Exception as exc:  # pragma: no cover - 依赖缺失/无 GPU
+        print(f"  CUDA 检测失败    : {exc}")
 
     model_dir = settings.resolve_model_dir()
     cached = []
@@ -207,7 +223,7 @@ def run_check() -> int:
     if failed:
         print(f"自检发现 {failed} 个依赖缺失，请运行 setup.bat 安装依赖。")
         return 1
-    print("自检通过。运行 run.bat（或 python -m voxscribe）打开界面。")
+    print("自检通过。运行 run.vbs（或 .venv\\Scripts\\pythonw.exe -m voxscribe）打开界面。")
     return 0
 
 

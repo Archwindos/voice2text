@@ -1,19 +1,23 @@
-"""图形界面主窗口与启动入口（v1.1）。
+"""图形界面主窗口与启动入口（v1.2）。
 
 页面结构：
 * 首页「🎤 语音输入」：一键口述 → 本地转写 → DeepSeek「口述校对」→ 可编辑、
-  可复制的文字。大录音按钮 / F2 开始与结束，Canvas 实时波形，自动复制。
+  可复制的文字。大录音按钮 / 全局 Alt+~ 开始与结束，Canvas 实时波形，自动复制；
+  ASR 一完成就先显示原始转写，DeepSeek 润色回来后再原地替换（两段式出字更快）。
 * 「📁 文件转写」：原有的文件队列、批量处理、四格式导出、双标签预览。
 * 底部全局状态：进度条、状态文字、内存占用。
+* 系统托盘常驻：关闭/最小化默认隐藏到托盘，Alt+~ 在后台也能开始录音。
 
 线程模型：
 * 主线程只负责界面；
 * 语音输入与文件转写都在后台工作线程中执行，通过 ``ui_queue``
   把 :class:`JobEvent` 与自定义 UI 消息投递回主线程，主线程每 100ms 轮询；
-* 关闭 / 取消通过 ``threading.Event`` 通知后台。
+* 关闭 / 取消通过 ``threading.Event`` 通知后台；托盘回调通过 ``root.after(0, ...)``
+  投递回主线程。
 
-测试辅助：环境变量 ``VOXSCRIBE_GUI_AUTOCLOSE_MS`` 存在时，窗口打开后
-指定毫秒自动关闭（用于烟雾测试 / 截图），不影响正常使用。
+测试辅助：``VOXSCRIBE_GUI_HIDDEN=1`` 时窗口不显示、不创建托盘、关闭时正常销毁；
+``VOXSCRIBE_DISABLE_TRAY=1`` 单独禁用托盘；``VOXSCRIBE_GUI_AUTOCLOSE_MS``
+存在时窗口打开后指定毫秒自动关闭（隐藏模式冒烟测试用）。
 """
 
 from __future__ import annotations
@@ -53,7 +57,14 @@ from ..pipeline import Pipeline
 from ..util import human_duration, process_memory_mb, reveal_path
 from . import theme as theme_module
 from .dialogs import HelpDialog, SettingsDialog, show_welcome
+from .hotkey import HOTKEY_LABEL, HotkeyListener
 from .theme import BODY_SIZE, COLORS, SMALL_SIZE, UI_SIZE, Theme, center_window
+from .tray import (
+    HIDDEN_HINT_MESSAGE,
+    HIDDEN_HINT_TITLE,
+    TrayIcon,
+    tray_available,
+)
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +77,9 @@ QUICK_STYLE = "proofread"
 QUICK_STYLE_LABEL = STYLES.get(QUICK_STYLE, "口述校对")
 HOME_PLACEHOLDER = "转换后的文字会出现在这里，可直接复制或修改"
 FULL_WIDTH_SPACE = "\u3000"
+START_BUTTON_TEXT = f"● 开始录音{FULL_WIDTH_SPACE}{HOTKEY_LABEL}"
+STOP_BUTTON_TEXT = f"■ 停止并转换{FULL_WIDTH_SPACE}{HOTKEY_LABEL}"
+CONVERTING_BUTTON_TEXT = "转换中…"
 
 AUDIO_EXTENSIONS = frozenset(
     {
@@ -136,6 +150,11 @@ except Exception:  # pragma: no cover
 def _shorten(text: str, limit: int = 60) -> str:
     text = (text or "").replace("\n", " ").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _env_flag(name: str) -> bool:
+    """读取布尔环境变量（1/true/yes/on）。"""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _read_autoclose_ms() -> int:
@@ -246,6 +265,20 @@ class MainWindow:
         self._dnd_available = _DND_AVAILABLE
         self._dnd_enabled = False
 
+        # ---- v1.2：隐藏测试模式 / 托盘 / 全局快捷键 ----
+        self._hidden_mode = _env_flag("VOXSCRIBE_GUI_HIDDEN")
+        self._tray_disabled = _env_flag("VOXSCRIBE_DISABLE_TRAY") or self._hidden_mode
+        self._quitting = False
+        self._tray: Optional[Any] = None
+        self._tray_hint_shown = False
+        self._tray_job: Optional[str] = None
+        self._hotkey: Optional[HotkeyListener] = None
+        self._quick_interim_text = ""
+        # 模型预热（v1.2：启动后后台加载 GPU 模型，保证首句也快）
+        self._warming_up = False
+        self._warmup_seq = 0
+        self._warmup_job: Optional[str] = None
+
         self._configure_window()
         self._build_ui()
         self._restore_geometry()
@@ -257,9 +290,20 @@ class MainWindow:
         self._set_home_timer(None)
         self._set_home_mode_hint()
         self._draw_home_idle()
+        self._init_hotkey()
 
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self.root.report_callback_exception = self._on_callback_exception
+        self.root.bind("<Unmap>", self._on_window_unmap)
+        if self._hidden_mode:
+            # 测试/后台模式：不显示窗口、不创建托盘、关闭时直接销毁
+            try:
+                self.root.withdraw()
+            except tk.TclError:  # pragma: no cover
+                pass
+        else:
+            # 等主窗口真正显示出来后再创建托盘图标
+            self._tray_job = self.root.after(300, self._init_tray)
 
         self._update_memory()
         self._schedule_idle_check()
@@ -270,6 +314,9 @@ class MainWindow:
         else:
             self._startup_jobs.append(self.root.after(450, self._maybe_show_first_run))
             self._startup_jobs.append(self.root.after(700, self._startup_hints))
+            if not self._hidden_mode:
+                # 启动后后台预热识别模型（GPU），让第一句口述也快
+                self._startup_jobs.append(self.root.after(650, self._start_warmup))
 
     # ==================================================================
     # 窗口与整体布局
@@ -439,7 +486,7 @@ class MainWindow:
         if self._quick_state != "idle":
             messagebox.showinfo(
                 "请先结束当前操作",
-                "正在录音或转换文字，请先结束（再按一次 F2）或按 Esc 取消后再切换页面。",
+                f"正在录音或转换文字，请先结束（再按一次 {HOTKEY_LABEL}）或按 Esc 取消后再切换页面。",
                 parent=self.root,
             )
             return
@@ -607,7 +654,7 @@ class MainWindow:
 
         self.home_record_btn = tk.Button(
             input_body,
-            text=f"● 开始录音{FULL_WIDTH_SPACE}F2",
+            text=START_BUTTON_TEXT,
             command=self._toggle_quick,
             bg=colors["primary"],
             fg="#ffffff",
@@ -635,7 +682,9 @@ class MainWindow:
         )
         self.home_timer_label.pack_forget()
 
-        self.home_status_var = tk.StringVar(value="不用打字：按 F2 说一段，再按一次结束")
+        self.home_status_var = tk.StringVar(
+            value=f"不用打字：按 {HOTKEY_LABEL} 说一段，再按一次结束"
+        )
         self.home_status_label = tk.Label(
             input_body,
             textvariable=self.home_status_var,
@@ -1064,7 +1113,8 @@ class MainWindow:
         else:
             self._quick_start()
 
-    def _on_f2(self, _event: Any = None) -> None:
+    def _on_hotkey(self) -> None:
+        """全局 Alt+~：开始/停止录音（窗口前台、最小化到托盘或隐藏时都生效）。"""
         self._toggle_quick()
 
     def _quick_start(self) -> None:
@@ -1116,12 +1166,14 @@ class MainWindow:
         self._wave_phase = 0
         self._wave_idle_hint = ""
         self._set_home_timer("00:00")
-        self._set_home_status("正在聆听，请说话…")
+        self._set_home_status(self._listening_status())
         self._hide_home_inline_hint()
         self._refresh_action_states()
         self._draw_home_recording([])
         self._start_wave_tick()
-        self._set_status("语音输入：正在录音…（再按 F2 或点击按钮结束）")
+        self._set_status(
+            f"语音输入：正在录音…（再按 {HOTKEY_LABEL} 或点击按钮结束）"
+        )
 
     def _quick_stop_and_convert(self) -> None:
         if self._quick_state != "recording":
@@ -1180,6 +1232,7 @@ class MainWindow:
         self._quick_refine_used = refine
         self._quick_stage_label = "正在转写…"
         self._quick_percent = 0.0
+        self._quick_interim_text = ""
         self._wave_phase = 0
         self._set_home_timer("00:00")
         self._set_home_status(f"正在转写…{' 随后 DeepSeek 整理' if refine else ''}")
@@ -1202,7 +1255,13 @@ class MainWindow:
         def worker() -> None:
             try:
                 result = self.pipeline.transcribe_and_refine(
-                    audio_path, job, emit, self._quick_cancel
+                    audio_path,
+                    job,
+                    emit,
+                    self._quick_cancel,
+                    on_transcript=lambda transcript: self.ui_queue.put(
+                        ("quick_transcript", seq, transcript)
+                    ),
                 )
             except CancelledError:
                 self.ui_queue.put(("quick_cancelled", seq, None))
@@ -1260,7 +1319,12 @@ class MainWindow:
             ratio = max(0.0, min(1.0, float(ratio))) if ratio >= 0 else 0.0
             self._quick_percent = start + (end - start) * ratio
             self.progress_var.set(self._quick_percent)
-            label = "正在转写…" if stage in ("prepare", "asr") else "DeepSeek 整理中…"
+            if stage in ("prepare", "asr"):
+                label = "正在转写…"
+            elif self._quick_interim_text:
+                label = "已转写，正在 DeepSeek 润色…"
+            else:
+                label = "DeepSeek 整理中…"
             self._quick_stage_label = label
             self._set_home_status(f"{label}  {int(round(self._quick_percent))}%")
             message = _shorten(event.message or label, 44)
@@ -1269,9 +1333,30 @@ class MainWindow:
             self.progress_var.set(100.0)
             self._set_status(f"语音输入：{event.message or '转换完成'}")
 
+    def _on_quick_transcript(self, transcript: Any) -> None:
+        """ASR 完成、DeepSeek 开始前先显示原始转写（两段式：先出字，再润色）。"""
+        if self._quick_state != "converting":
+            return
+        text = (getattr(transcript, "text", "") or "").strip()
+        if not text:
+            return
+        self._quick_interim_text = text
+        self._set_home_text(text)
+        if self._quick_has_key:
+            stage_label = "已转写，正在 DeepSeek 润色…"
+            self._set_status("语音输入：已转写，正在 DeepSeek 润色…")
+        else:
+            stage_label = "已转写，正在本地整理…"
+            self._set_status("语音输入：已转写，正在本地整理…")
+        self._quick_stage_label = stage_label
+        self._set_home_status(stage_label)
+        self._hide_home_inline_hint()
+        self._draw_home_converting()
+
     def _on_quick_done(self, result: JobResult) -> None:
         self._stop_wave_tick()
         self._quick_state = "idle"
+        self._quick_interim_text = ""
         # 最终状态一律以 JobResult.refined 为准，避免「未配置 Key」等中间状态串台
         refined = bool(result.refined and (result.refined.text or "").strip())
         text = (result.final_text or "").strip()
@@ -1314,8 +1399,10 @@ class MainWindow:
         self._set_home_mode_hint()
 
     def _on_quick_cancelled(self) -> None:
+        kept = bool(self._get_home_text())
+        status = "转换已取消。" if not kept else "转换已取消（已保留已转写的文字）。"
         self._reset_quick_idle(
-            status="转换已取消。",
+            status=status,
             wave_hint="转换已取消，可以重新说一段",
         )
 
@@ -1364,7 +1451,7 @@ class MainWindow:
             self._last_levels = levels
             self._draw_home_recording(levels)
             self._set_home_timer(format_timestamp(self._recording_elapsed()))
-            self._set_home_status("正在聆听，请说话…")
+            self._set_home_status(self._listening_status())
         elif self._quick_state == "converting":
             self._wave_phase += 1
             self._draw_home_converting()
@@ -1417,7 +1504,7 @@ class MainWindow:
             button = self.home_record_btn
             if self._quick_state == "recording":
                 button.configure(
-                    text=f"■ 停止并转换{FULL_WIDTH_SPACE}F2",
+                    text=STOP_BUTTON_TEXT,
                     bg=COLORS["record"],
                     activebackground=COLORS["record_dark"],
                     fg="#ffffff",
@@ -1426,7 +1513,7 @@ class MainWindow:
                 )
             elif self._quick_state == "converting":
                 button.configure(
-                    text="转换中…",
+                    text=CONVERTING_BUTTON_TEXT,
                     bg=COLORS["trough"],
                     activebackground=COLORS["trough"],
                     fg=COLORS["muted"],
@@ -1436,7 +1523,7 @@ class MainWindow:
             else:
                 if recorder_ok and not self._processing:
                     button.configure(
-                        text=f"● 开始录音{FULL_WIDTH_SPACE}F2",
+                        text=START_BUTTON_TEXT,
                         bg=COLORS["primary"],
                         activebackground=COLORS["primary_dark"],
                         fg="#ffffff",
@@ -1471,6 +1558,7 @@ class MainWindow:
         except (tk.TclError, AttributeError):  # pragma: no cover - 构建期调用
             return
         self._set_home_mode_hint()
+        self._refresh_tray()
 
     # ==================================================================
     # 文件转写页
@@ -1852,7 +1940,7 @@ class MainWindow:
     # 快捷键
     # ==================================================================
     def _bind_shortcuts(self) -> None:
-        self.root.bind("<F2>", self._on_f2)
+        # Alt+~ 是全局快捷键（gui/hotkey.py 轮询全局键盘状态，不占用系统热键）
         self.root.bind("<Escape>", self._on_escape)
         self.root.bind("<Control-Return>", self._on_home_copy_shortcut)
         self.root.bind("<Control-o>", lambda _event: self._add_files())
@@ -2368,6 +2456,10 @@ class MainWindow:
             _, seq, event = message
             if seq == self._quick_seq:
                 self._on_quick_event(event)
+        elif kind == "quick_transcript":
+            _, seq, transcript = message
+            if seq == self._quick_seq:
+                self._on_quick_transcript(transcript)
         elif kind == "quick_done":
             _, seq, result = message
             if seq == self._quick_seq:
@@ -2380,6 +2472,14 @@ class MainWindow:
             _, seq, exc = message
             if seq == self._quick_seq:
                 self._on_quick_error(exc)
+        elif kind == "warmup_done":
+            _, seq, ok = message
+            if seq == self._warmup_seq:
+                self._on_warmup_done(bool(ok))
+        elif kind == "warmup_error":
+            _, seq, exc = message
+            if seq == self._warmup_seq:
+                self._on_warmup_error(exc)
 
     def _overall_percent(self, stage: str, ratio: Optional[float]) -> float:
         start, end = _STAGE_WEIGHTS.get(stage, (0.0, 100.0))
@@ -2608,7 +2708,7 @@ class MainWindow:
         HelpDialog(self.root, self.theme, self.settings).show()
 
     def _maybe_show_first_run(self) -> None:
-        if self._closing:
+        if self._closing or self._hidden_mode:
             return
         if self.settings.first_run_done:
             return
@@ -2691,6 +2791,205 @@ class MainWindow:
         self._schedule_idle_check()
 
     # ==================================================================
+    # 全局快捷键 / 系统托盘 / 显示隐藏
+    # ==================================================================
+    def _init_hotkey(self) -> None:
+        """创建全局 Alt+~ 监听；隐藏测试模式下不启用真实键盘轮询。"""
+        try:
+            listener = HotkeyListener(
+                self.root, self._on_hotkey, interval_ms=50
+            )
+        except Exception:  # pragma: no cover - 极端环境
+            log.warning("初始化全局快捷键失败", exc_info=True)
+            self._hotkey = None
+            return
+        self._hotkey = listener
+        if self._hidden_mode:
+            return
+        if not listener.start():
+            log.info("全局快捷键不可用（仅 Windows 支持）")
+
+    # ------------------------------------------------------------------
+    # 模型预热（启动后后台加载，保证首句口述也快）
+    # ------------------------------------------------------------------
+    def _start_warmup(self) -> None:
+        """后台预热识别模型；失败只记录日志/状态，绝不弹窗。"""
+        self._warmup_job = None
+        if self._closing or self._hidden_mode:
+            return
+        if not bool(getattr(self.settings, "preload_model", True)):
+            log.info("设置中已关闭模型预热")
+            return
+        if self._quick_state != "idle" or self._processing:
+            return
+        warm_up = getattr(self.pipeline, "warm_up", None)
+        if not callable(warm_up):
+            return
+        self._warming_up = True
+        self._warmup_seq += 1
+        seq = self._warmup_seq
+        self._set_status("正在预热识别模型（首次使用稍等）…")
+
+        def worker() -> None:
+            try:
+                ok = bool(warm_up())
+            except Exception as exc:  # warm_up 约定不抛异常，这里仍兜底
+                log.warning("识别模型预热失败", exc_info=True)
+                self.ui_queue.put(("warmup_error", seq, exc))
+            else:
+                self.ui_queue.put(("warmup_done", seq, ok))
+
+        threading.Thread(
+            target=worker, name="voxscribe-warmup", daemon=True
+        ).start()
+
+    def _on_warmup_done(self, ok: bool) -> None:
+        self._warming_up = False
+        if ok:
+            log.info("识别模型预热完成")
+            if self._quick_state == "idle" and not self._processing:
+                self._set_status("识别模型已就绪（GPU 预热完成）")
+        else:
+            log.info("识别模型预热未成功，首次转写时会自动加载")
+            if self._quick_state == "idle" and not self._processing:
+                self._set_status("模型预热未成功，首次转写时会自动加载")
+
+    def _on_warmup_error(self, exc: BaseException) -> None:
+        self._warming_up = False
+        log.warning("识别模型预热异常：%s", exc)
+        if self._quick_state == "idle" and not self._processing:
+            self._set_status("模型预热未成功，首次转写时会自动加载")
+
+    def _listening_status(self) -> str:
+        if self._warming_up:
+            return "正在聆听，请说话…（识别模型正在预热，首次使用稍等）"
+        return "正在聆听，请说话…"
+
+    def _window_visible(self) -> bool:
+        try:
+            return self.root.state() == "normal"
+        except tk.TclError:  # pragma: no cover
+            return False
+
+    def _init_tray(self) -> None:
+        """创建系统托盘；隐藏测试模式、禁用环境变量或缺少依赖时跳过。"""
+        self._tray_job = None
+        if self._quitting or self._tray is not None:
+            return
+        if self._hidden_mode or self._tray_disabled:
+            log.info("托盘已禁用（隐藏测试模式或 VOXSCRIBE_DISABLE_TRAY=1）")
+            return
+        if not tray_available():
+            return
+        try:
+            tray = TrayIcon(
+                self.root,
+                on_toggle_window=self._toggle_window_from_tray,
+                on_toggle_recording=self._toggle_quick_from_tray,
+                on_quit=self._quit_from_tray,
+                is_recording=lambda: self._quick_state == "recording",
+                is_visible=self._window_visible,
+            )
+            if tray.start():
+                self._tray = tray
+                self._refresh_tray()
+                log.info("系统托盘已就绪")
+            else:
+                self._tray = None
+        except Exception:
+            log.warning("创建系统托盘失败，将使用普通关闭逻辑", exc_info=True)
+            self._tray = None
+
+    def _refresh_tray(self) -> None:
+        tray = self._tray
+        if tray is None:
+            return
+        try:
+            tray.update_state()
+        except Exception:  # pragma: no cover - 托盘已销毁
+            log.debug("刷新托盘状态失败", exc_info=True)
+
+    def _show_window_from_tray(self) -> None:
+        if self._quitting:
+            return
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:  # pragma: no cover
+            return
+        self._set_status("已从托盘恢复窗口")
+        self._refresh_tray()
+
+    def _hide_to_tray(self, *, notify: bool = True) -> bool:
+        """隐藏窗口到托盘；没有托盘时返回 False（调用方退回普通关闭）。"""
+        tray = self._tray
+        if tray is None or self._quitting:
+            return False
+        try:
+            self.root.withdraw()
+        except tk.TclError:  # pragma: no cover
+            return False
+        if notify and not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            tray.notify(HIDDEN_HINT_TITLE, HIDDEN_HINT_MESSAGE)
+        self._refresh_tray()
+        return True
+
+    def _toggle_window_from_tray(self) -> None:
+        if self._window_visible():
+            self._hide_to_tray(notify=False)
+        else:
+            self._show_window_from_tray()
+
+    def _toggle_quick_from_tray(self) -> None:
+        """托盘菜单「开始/停止录音」：窗口隐藏时也可直接开始录音。"""
+        if self._quitting:
+            return
+        self._toggle_quick()
+        self._refresh_tray()
+
+    def _quit_from_tray(self) -> None:
+        """托盘菜单「退出」：跳过确认，直接销毁。"""
+        if self._quitting:
+            return
+        self._quitting = True
+        self._on_close()
+
+    def _on_close_request(self) -> None:
+        """点窗口关闭按钮：默认隐藏到托盘；无托盘时正常退出。"""
+        if self._quitting:
+            return
+        if self._hidden_mode or self._tray is None:
+            self._on_close()
+            return
+        if not bool(getattr(self.settings, "close_to_tray", True)):
+            self._on_close()
+            return
+        if not self._hide_to_tray(notify=True):
+            self._on_close()
+
+    def _on_window_unmap(self, _event: Any = None) -> None:
+        """最小化（iconify）时也隐藏到托盘。"""
+        if self._hidden_mode or self._tray is None or self._quitting:
+            return
+        try:
+            self.root.after(80, self._maybe_hide_iconified)
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _maybe_hide_iconified(self) -> None:
+        if self._quitting or self._tray is None:
+            return
+        try:
+            state = self.root.state()
+        except tk.TclError:  # pragma: no cover
+            return
+        if state == "iconic":
+            self._hide_to_tray(notify=True)
+
+    # ==================================================================
     # 关闭与异常
     # ==================================================================
     def _on_callback_exception(
@@ -2711,6 +3010,10 @@ class MainWindow:
 
     def _on_close(self) -> None:
         if self._closing:
+            return
+        if self._hidden_mode or self._quitting:
+            # 隐藏测试模式 / 托盘「退出」：直接销毁，绝不弹确认框（避免测试挂住）
+            self._finish_close()
             return
         if self._quick_state == "recording":
             if not messagebox.askyesno(
@@ -2733,10 +3036,35 @@ class MainWindow:
                 parent=self.root,
             ):
                 return
+        self._finish_close()
 
+    def _finish_close(self) -> None:
+        """真正的退出清理：停止热键/托盘、取消任务、保存配置、销毁窗口。"""
+        if self._closing:
+            return
         self._closing = True
         self._quick_cancel.set()
         self._cancel_event.set()
+
+        # 先停全局热键与托盘，避免退出过程中还有后台回调
+        try:
+            if self._hotkey is not None:
+                self._hotkey.stop()
+                self._hotkey = None
+        except Exception:  # pragma: no cover
+            log.debug("退出时停止全局快捷键失败", exc_info=True)
+        try:
+            if self._tray_job is not None:
+                self.root.after_cancel(self._tray_job)
+                self._tray_job = None
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            if self._tray is not None:
+                self._tray.stop()
+                self._tray = None
+        except Exception:  # pragma: no cover
+            log.debug("退出时停止托盘失败", exc_info=True)
 
         for attribute in (
             "_poll_job",
@@ -2745,6 +3073,7 @@ class MainWindow:
             "_save_job",
             "_wave_job",
             "_autoclose_job",
+            "_warmup_job",
         ):
             job = getattr(self, attribute, None)
             if job is not None:

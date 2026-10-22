@@ -9,7 +9,7 @@
 设计目标：轻量、离线可用、CPU 占用可控、模型空闲自动卸载。
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 APP_NAME = "VoxScribe"
 APP_DISPLAY_NAME = "语声成文"
 

@@ -25,6 +25,10 @@
 * 中文场景默认加 ``initial_prompt``（见 :data:`ZH_INITIAL_PROMPT`）：
   实测 tiny 模型在中文 TTS 上不加提示会输出繁体（「那個」「項目」「禁讀」），
   加上提示后输出简体且识别更准（「项目」「进度」「两周」），速度不变。
+* v1.2 GPU 支持：``device="cuda"`` 时加载前自动把 pip 安装的 NVIDIA CUDA
+  运行库目录（``site-packages/nvidia/*/bin``）加入 DLL 搜索路径；``compute_type``
+  支持 ``"auto"``（GPU→float16，CPU→int8）。GPU 加载失败会抛 :class:`ASRError`
+  并提示如何回退 CPU，**绝不静默降级到 CPU**（产品要求必须用 GPU）。
 * 不向 stdout 打印；日志走 ``logging``，用户可见提示走 ``on_progress``。
 
 已知限制：模型首次下载/加载无法从外部打断（faster-whisper 自身不支持），
@@ -37,6 +41,8 @@ import gc
 import logging
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -203,6 +209,203 @@ def _is_decode_error(exc: BaseException) -> bool:
     return any(word in chain for word in keywords)
 
 
+# ---------------------------------------------------------------------------
+# GPU / CUDA 支持（v1.2）
+# ---------------------------------------------------------------------------
+#: os.add_dll_directory 返回的句柄必须保持引用，否则目录会被提前移除
+_DLL_DIR_HANDLES: List[object] = []
+#: 已经加入过 DLL 搜索路径的目录（小写绝对路径），保证幂等
+_CONFIGURED_DLL_DIRS: set[str] = set()
+#: CUDA 相关错误关键字，用于把底层异常翻译成中文提示
+_CUDA_ERROR_KEYWORDS = (
+    "cuda",
+    "cublas",
+    "cudnn",
+    "cudart",
+    "cusparse",
+    "cufft",
+    "nvidia",
+    "gpu",
+    "dll",
+    "driver",
+    "no kernel image",
+    "out of memory",
+    "compute capability",
+)
+
+
+def is_cuda_device(device: Optional[str]) -> bool:
+    """``device`` 是否为 CUDA（支持 ``"cuda"`` / ``"cuda:0"`` 写法）。"""
+    return str(device or "").strip().lower().startswith("cuda")
+
+
+def resolve_compute_type(device: Optional[str], requested: Optional[str]) -> str:
+    """解析实际使用的 ``compute_type``。
+
+    * GPU（device="cuda"）且请求 auto / 空 → ``"float16"``（RTX 显卡速度/精度最佳）；
+    * CPU 且请求 auto / 空 → ``"int8"``（轻量、内存占用低）；
+    * 显式指定（如 ``"int8_float16"``）→ 原样返回。
+
+    :param device: ``"cuda"`` / ``"cpu"``（也接受 ``"cuda:0"``）。
+    :param requested: 用户/配置请求的精度，可为 ``None`` / ``""`` / ``"auto"``。
+    """
+    requested_clean = str(requested or "").strip()
+    if requested_clean.lower() in ("", "auto", "default"):
+        return "float16" if is_cuda_device(device) else "int8"
+    return requested_clean
+
+
+def _default_site_package_roots() -> List[Path]:
+    """当前 Python 环境的 site-packages 根目录（去重，保持存在性检查）。"""
+    candidates: List[str] = []
+    try:
+        import site as site_module  # 标准库
+
+        candidates.extend(site_module.getsitepackages())
+    except Exception:  # pragma: no cover - 极少数嵌入式环境
+        log.debug("无法通过 site.getsitepackages() 定位依赖目录", exc_info=True)
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates.extend(
+        [
+            str(Path(sys.prefix) / "Lib" / "site-packages"),  # Windows venv
+            str(Path(sys.prefix) / "lib" / version / "site-packages"),  # Linux/macOS
+        ]
+    )
+    roots: List[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            path = Path(candidate)
+            key = str(path.resolve())
+            if key in seen or not path.is_dir():
+                continue
+        except OSError:
+            continue
+        seen.add(key)
+        roots.append(path)
+    return roots
+
+
+def find_cuda_dll_directories(
+    site_roots: Optional[List[Path]] = None,
+) -> List[Path]:
+    """发现 pip 安装的 NVIDIA CUDA 运行库 DLL 目录。
+
+    新版 CUDA 相关 pip 包（``nvidia-cublas-cu12`` / ``nvidia-cudnn-cu12`` 等）
+    会把 DLL 放在 ``site-packages/nvidia/<组件>/bin``（Windows）或
+    ``site-packages/nvidia/<组件>/lib``（Linux）下，这些目录默认不在 DLL
+    搜索路径里，需要手动 ``os.add_dll_directory`` / 加入 PATH。
+
+    :param site_roots: 用于测试的 site-packages 根目录列表；``None`` 时自动探测。
+    :return: 找到的 DLL 目录（排序、去重，路径不存在时返回空列表）。
+    """
+    roots = [Path(root) for root in site_roots] if site_roots is not None else _default_site_package_roots()
+    directories: List[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        nvidia_root = root / "nvidia"
+        try:
+            if not nvidia_root.is_dir():
+                continue
+            components = list(nvidia_root.iterdir())
+        except OSError:
+            continue
+        for component in components:
+            for sub_name in ("bin", "lib"):
+                dll_dir = component / sub_name
+                try:
+                    if not dll_dir.is_dir():
+                        continue
+                    key = str(dll_dir.resolve())
+                except OSError:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                directories.append(dll_dir)
+    directories.sort(key=lambda path: str(path).lower())
+    return directories
+
+
+def ensure_cuda_dll_directories(
+    site_roots: Optional[List[Path]] = None,
+) -> List[Path]:
+    """把 NVIDIA CUDA DLL 目录加入 Windows DLL 搜索路径（幂等）。
+
+    对每个目录调用一次 ``os.add_dll_directory``（句柄保存在模块变量里防止被回收），
+    并把目录加入 ``PATH``，让 ctranslate2 加载 ``cublas64_12.dll`` /
+    ``cudnn64_9.dll`` 等运行库时能够找到。非 Windows 平台只返回目录不做处理。
+
+    :param site_roots: 用于测试的 site-packages 根目录列表；``None`` 时自动探测。
+    :return: 发现的 DLL 目录列表（即使已经配置过也会返回，方便日志展示）。
+    """
+    directories = find_cuda_dll_directories(site_roots)
+    if sys.platform != "win32" or not directories:
+        return directories
+
+    path_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    normalized_path = {os.path.normcase(part) for part in path_parts}
+    changed = False
+    for directory in directories:
+        key = str(directory).lower()
+        if key not in _CONFIGURED_DLL_DIRS:
+            try:
+                handle = os.add_dll_directory(str(directory))
+                _DLL_DIR_HANDLES.append(handle)
+            except (AttributeError, OSError):
+                log.debug("加入 DLL 搜索目录失败：%s", directory, exc_info=True)
+            _CONFIGURED_DLL_DIRS.add(key)
+        normalized_dir = os.path.normcase(str(directory))
+        if normalized_dir not in normalized_path:
+            path_parts.insert(0, str(directory))
+            normalized_path.add(normalized_dir)
+            changed = True
+    if changed:
+        os.environ["PATH"] = os.pathsep.join(path_parts)
+    return directories
+
+
+def get_cuda_device_count() -> int:
+    """CUDA 可用设备数（不 import faster-whisper / torch；失败返回 0）。"""
+    try:
+        import ctranslate2  # noqa: PLC0415  只有用 GPU 时才 import
+    except Exception:
+        return 0
+    try:
+        return max(0, int(ctranslate2.get_cuda_device_count()))
+    except Exception:
+        return 0
+
+
+def get_cuda_compute_types() -> set[str]:
+    """当前 GPU 支持的 compute_type 集合（失败返回空集合）。"""
+    try:
+        import ctranslate2  # noqa: PLC0415
+
+        return {str(item).lower() for item in ctranslate2.get_supported_compute_types("cuda")}
+    except Exception:
+        return set()
+
+
+def get_gpu_name() -> str:
+    """通过 nvidia-smi 查询 GPU 名称（仅用于日志；失败返回空串，不弹窗口）。"""
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+            creationflags=creation_flags,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    lines = [line.strip() for line in result.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
+    return lines[0] if lines else ""
+
+
 class WhisperASR:
     """faster-whisper 的懒加载封装。"""
 
@@ -211,7 +414,7 @@ class WhisperASR:
         *,
         model_size: str = "small",
         device: str = "cpu",
-        compute_type: str = "int8",
+        compute_type: str = "auto",
         cpu_threads: int = 4,
         model_dir: Optional[str] = None,
         beam_size: int = 5,
@@ -220,7 +423,10 @@ class WhisperASR:
     ) -> None:
         self.model_size = (model_size or "small").strip() or "small"
         self.device = (device or "cpu").strip() or "cpu"
-        self.compute_type = (compute_type or "int8").strip() or "int8"
+        #: 用户/配置请求的精度；"auto" 表示按设备自动选择（GPU→float16，CPU→int8）
+        self.requested_compute_type = (compute_type or "auto").strip() or "auto"
+        #: 实际传给 CTranslate2 的 compute_type（解析后）
+        self.compute_type = resolve_compute_type(self.device, self.requested_compute_type)
         self.model_dir: Path = (
             Path(model_dir).expanduser() if model_dir else models_dir()
         )
@@ -238,6 +444,8 @@ class WhisperASR:
 
         self._model: Optional[object] = None
         self._lock = threading.RLock()
+        #: 最近一次检测到的 GPU 名称（仅用于日志展示）
+        self._gpu_name = ""
 
     # ------------------------------------------------------------------
     # 状态与本地缓存
@@ -453,8 +661,16 @@ class WhisperASR:
             if cancel.is_set():
                 raise errors.CancelledError("任务已取消")
 
+            # 1) GPU 设备：必须先把 pip 安装的 CUDA 运行库目录加入 DLL 搜索路径，
+            #    然后再 import faster_whisper / ctranslate2，否则 Windows 上
+            #    加载 cublas64_12.dll / cudnn64_9.dll 会失败（顺序很关键）。
+            if is_cuda_device(self.device):
+                self._call_progress(on_progress, 0.0, "正在准备 GPU 识别环境…")
+                self._prepare_cuda_environment()
+
+            # 2) 懒 import faster-whisper（启动时不 import，不拖慢冷启动）
             try:
-                import faster_whisper  # noqa: PLC0415  懒加载：启动时不 import
+                import faster_whisper  # noqa: PLC0415
             except Exception as exc:  # 缺依赖
                 raise errors.ASRError(
                     "缺少语音识别组件（faster-whisper），无法转写",
@@ -479,10 +695,11 @@ class WhisperASR:
                 )
                 monitor = self._start_download_monitor(on_progress)
             else:
+                device_label = "GPU" if is_cuda_device(self.device) else "CPU"
                 self._call_progress(
                     on_progress,
                     0.0,
-                    f"正在加载本地识别模型（{self.model_size}）…",
+                    f"正在加载本地识别模型（{self.model_size}，{device_label}）…",
                 )
 
             try:
@@ -494,23 +711,118 @@ class WhisperASR:
             finally:
                 self._stop_monitor(monitor)
 
+            if is_cuda_device(self.device):
+                # CUDA 运行库是懒加载的：构造 WhisperModel 成功不代表 GPU 真能用。
+                # 先做一次最小推理，把缺 cublas/cuDNN、显存不足等问题在「加载阶段」
+                # 就暴露成 ASRError（而不是转写做到一半才失败）。
+                try:
+                    self._warmup_cuda_model(model)
+                except errors.VoxError:
+                    del model
+                    gc.collect()
+                    raise
+                except Exception as exc:
+                    del model
+                    gc.collect()
+                    raise self._wrap_load_error(exc, needs_download=False) from exc
+
             self._model = model
-            log.info(
-                "识别模型 %s 已加载（设备 %s，%s，%d 线程）",
-                self.model_size,
-                self.device,
-                self.compute_type,
-                self.cpu_threads,
-            )
+            if is_cuda_device(self.device):
+                log.info(
+                    "识别模型 %s 已加载到 GPU（device=%s，compute_type=%s，"
+                    "GPU=%s，CUDA 设备数=%d）",
+                    self.model_size,
+                    self.device,
+                    self.compute_type,
+                    self._gpu_name or "未知",
+                    get_cuda_device_count(),
+                )
+            else:
+                log.info(
+                    "识别模型 %s 已加载（device=%s，compute_type=%s，%d 线程）",
+                    self.model_size,
+                    self.device,
+                    self.compute_type,
+                    self.cpu_threads,
+                )
             if cancel.is_set():
                 raise errors.CancelledError("任务已取消")
             self._call_progress(on_progress, 0.0, "识别模型已就绪，开始转写…")
             return model
 
+    def _warmup_cuda_model(self, model: object) -> None:
+        """GPU 加载后做一次最小推理，提前暴露 CUDA 运行库 / 显存问题。"""
+        try:
+            import numpy as np  # faster-whisper 依赖，无需新装
+        except Exception:  # pragma: no cover - numpy 缺失时跳过预热
+            log.debug("numpy 不可用，跳过 GPU 预热", exc_info=True)
+            return
+        n_mels = 80
+        try:
+            n_mels = int(getattr(getattr(model, "model", None), "n_mels", 80) or 80)
+        except Exception:
+            pass
+        features = np.zeros((1, n_mels, 3000), dtype=np.float32)
+        started = time.monotonic()
+        model.encode(features)  # type: ignore[attr-defined]  触发一次真实的 GPU 推理
+        log.info("GPU 预热完成（%.0f ms）", (time.monotonic() - started) * 1000)
+
+    def _prepare_cuda_environment(self) -> None:
+        """GPU 加载前置检查：注入 CUDA DLL 目录、确认 GPU 与 compute_type 可用。
+
+        只做检测与准备，不修改用户设置；任何问题都抛 :class:`ASRError`
+        （中文提示如何安装 CUDA 依赖或回退 CPU），不会静默降级到 CPU。
+        """
+        directories = ensure_cuda_dll_directories()
+        if directories:
+            log.info(
+                "已加入 %d 个 NVIDIA CUDA DLL 目录：%s",
+                len(directories),
+                "; ".join(str(path) for path in directories),
+            )
+        else:
+            log.info("未发现 pip 安装的 NVIDIA CUDA 运行库目录，尝试使用系统 CUDA 库")
+
+        try:
+            import ctranslate2  # noqa: PLC0415
+        except Exception as exc:
+            raise errors.ASRError(
+                "缺少 GPU 识别所需组件（ctranslate2 / CUDA）",
+                hint="请重新安装依赖（setup.bat）；如需先用 CPU，可在设置里把"
+                "识别设备改为 CPU（asr_device=cpu）。",
+            ) from exc
+
+        device_count = get_cuda_device_count()
+        if device_count <= 0:
+            raise errors.ASRError(
+                "未检测到可用的 NVIDIA GPU，无法使用 GPU 转写",
+                hint="请确认 NVIDIA 显卡驱动已安装且显卡未被禁用；"
+                "如需改用 CPU，请在设置里把识别设备改为 CPU（asr_device=cpu）。",
+            )
+
+        self._gpu_name = get_gpu_name()
+        supported = get_cuda_compute_types()
+        requested = self.compute_type.lower()
+        if supported and requested not in supported:
+            raise errors.ASRError(
+                f"当前 GPU 不支持 compute_type={self.compute_type}",
+                hint="可把计算精度设置为 auto（GPU 自动使用 float16），"
+                "或选择 int8_float16；也可以在设置里把识别设备改为 CPU（asr_device=cpu）。",
+            )
+        log.info(
+            "GPU 环境检查通过：device=%s，compute_type=%s，GPU=%s（%d 张），支持精度=%s",
+            self.device,
+            self.compute_type,
+            self._gpu_name or "未知",
+            device_count,
+            ", ".join(sorted(supported)) or "未知",
+        )
+
     def _create_model(self, faster_whisper_module, cached: Optional[Path]) -> object:
         """真正创建 WhisperModel；cached 为本地快照目录时完全不联网。"""
         common_kwargs = dict(
             device=self.device,
+            device_index=0,
             compute_type=self.compute_type,
             cpu_threads=self.cpu_threads,
             download_root=str(self.model_dir),
@@ -601,6 +913,20 @@ class WhisperASR:
                 continue
         return total
 
+    def ensure_loaded(
+        self,
+        on_progress: Optional[ProgressCallback] = None,
+        cancel: Optional[threading.Event] = None,
+    ) -> None:
+        """预先加载识别模型（不转写），用于程序启动时预热，降低首句口述等待。
+
+        与 :meth:`transcribe` 共用同一实例；加载失败抛 :class:`ASRError`。
+        """
+        cancel = cancel or threading.Event()
+        if cancel.is_set():
+            raise errors.CancelledError("任务已取消")
+        self._ensure_model(on_progress, cancel)
+
     def unload(self) -> None:
         """卸载模型并触发垃圾回收；重复调用安全。"""
         with self._lock:
@@ -668,6 +994,15 @@ class WhisperASR:
                 hint="可在能访问 HuggingFace 的网络下重试；"
                 "公司网络受限时可设置环境变量 HF_ENDPOINT=https://hf-mirror.com 后重启程序。",
             )
+        if is_cuda_device(self.device):
+            chain = _exception_chain_text(exc)
+            if any(word in chain for word in _CUDA_ERROR_KEYWORDS):
+                return errors.ASRError(
+                    f"GPU（CUDA）加载识别模型失败：{_short_error(exc)}",
+                    hint="请确认 NVIDIA 显卡驱动与 CUDA 运行库（cublas / cuDNN）已正确安装；"
+                    "如果显存不足，可换用更小的模型（tiny/base）或关闭占用显存的程序；"
+                    "如需改用 CPU，请在设置里把识别设备改为 CPU（asr_device=cpu）后重试。",
+                )
         if isinstance(exc, ValueError) and "invalid model size" in str(exc).lower():
             return errors.ASRError(
                 f"无法识别的模型规格：{self.model_size}",
@@ -691,6 +1026,14 @@ class WhisperASR:
         """把解码 / 转写过程中的异常包装成中文 ASRError。"""
         log.warning("转写 %s 失败：%r", audio, exc)
         chain = _exception_chain_text(exc)
+        if is_cuda_device(self.device) and any(
+            word in chain for word in _CUDA_ERROR_KEYWORDS
+        ):
+            return errors.ASRError(
+                f"GPU（CUDA）转写失败：{_short_error(exc)}",
+                hint="请确认 NVIDIA 显卡驱动与 CUDA 运行库（cublas / cuDNN）安装完整；"
+                "如需改用 CPU，请在设置里把识别设备改为 CPU（asr_device=cpu）后重试。",
+            )
         if isinstance(exc, FileNotFoundError) or "no such file" in chain:
             return errors.ASRError(
                 f"找不到音频文件：{audio.name}",
@@ -729,4 +1072,16 @@ class WhisperASR:
         )
 
 
-__all__ = ["WhisperASR", "ProgressCallback", "MODEL_SIZE_HINTS", "ZH_INITIAL_PROMPT"]
+__all__ = [
+    "WhisperASR",
+    "ProgressCallback",
+    "MODEL_SIZE_HINTS",
+    "ZH_INITIAL_PROMPT",
+    "is_cuda_device",
+    "resolve_compute_type",
+    "find_cuda_dll_directories",
+    "ensure_cuda_dll_directories",
+    "get_cuda_device_count",
+    "get_cuda_compute_types",
+    "get_gpu_name",
+]

@@ -13,11 +13,33 @@ from voxscribe.config import AppSettings
 
 def test_defaults() -> None:
     settings = AppSettings()
-    assert settings.asr_model == "small"
+    assert settings.asr_model == "medium"
     assert settings.api_model == "deepseek-chat"
     assert settings.api_base_url.startswith("https://")
     assert 1 <= settings.effective_threads() <= 4
-    assert settings.idle_unload_seconds() == 300
+    assert settings.idle_unload_seconds() == 0  # 默认常驻，保证口述响应速度
+    assert settings.close_to_tray is True
+    assert settings.preload_model is True
+    assert settings.effective_device() == "cuda"
+    assert settings.effective_compute_type() == "float16"
+
+
+def test_device_and_compute_type() -> None:
+    settings = AppSettings(asr_device="cpu", compute_type="auto")
+    assert settings.effective_device() == "cpu"
+    assert settings.effective_compute_type() == "int8"
+
+    settings.asr_device = "cuda"
+    settings.compute_type = "auto"
+    assert settings.effective_compute_type() == "float16"
+
+    settings.compute_type = "int8_float16"
+    assert settings.effective_compute_type() == "int8_float16"
+
+    settings.asr_device = "gpu"
+    assert settings.effective_device() == "cuda"
+    settings.asr_device = "cpu-fallback"
+    assert settings.effective_device() == "cpu"
 
 
 def test_save_load_roundtrip(tmp_path: Path) -> None:
@@ -52,14 +74,14 @@ def test_corrupt_config_is_backed_up(tmp_path: Path) -> None:
     path.write_text("{ this is not json", encoding="utf-8")
 
     settings = AppSettings.load(path)
-    assert settings.asr_model == "small"
+    assert settings.asr_model == "medium"
     backup = path.with_suffix(path.suffix + ".broken")
     assert backup.exists()
 
 
 def test_missing_config_returns_defaults(tmp_path: Path) -> None:
     settings = AppSettings.load(tmp_path / "nope.json")
-    assert settings.asr_model == "small"
+    assert settings.asr_model == "medium"
 
 
 def test_api_key_roundtrip_and_storage() -> None:

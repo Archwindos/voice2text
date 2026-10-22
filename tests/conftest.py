@@ -18,8 +18,9 @@ from voxscribe.models import JobOptions, Segment, Transcript
 
 @pytest.fixture(scope="session", autouse=True)
 def _hide_gui_windows():
-    """测试期间不弹出任何 GUI 窗口（不在用户桌面上打扰）。"""
+    """测试期间不弹出任何 GUI 窗口、不创建托盘图标（不在用户桌面上打扰）。"""
     os.environ["VOXSCRIBE_GUI_HIDDEN"] = "1"
+    os.environ["VOXSCRIBE_DISABLE_TRAY"] = "1"
     yield
 
 

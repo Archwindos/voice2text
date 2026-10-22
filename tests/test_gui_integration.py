@@ -149,6 +149,8 @@ def test_file_page_batch_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     with MockAPIServer() as server:
         settings = AppSettings(
             asr_model="tiny",
+            asr_device="cpu",
+            compute_type="int8",
             cpu_threads=4,
             language="zh",
             model_dir=str(ROOT / "data" / "models"),
@@ -232,6 +234,8 @@ def test_home_page_quick_dictation_flow(
     with MockAPIServer() as server:
         settings = AppSettings(
             asr_model="tiny",
+            asr_device="cpu",
+            compute_type="int8",
             cpu_threads=4,
             language="zh",
             model_dir=str(ROOT / "data" / "models"),
@@ -310,6 +314,8 @@ def test_home_page_quick_dictation_without_api_key(
     with MockAPIServer() as server:
         settings = AppSettings(
             asr_model="tiny",
+            asr_device="cpu",
+            compute_type="int8",
             cpu_threads=4,
             language="zh",
             model_dir=str(ROOT / "data" / "models"),

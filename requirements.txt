@@ -4,3 +4,8 @@ requests>=2.31.0
 python-docx>=1.1.0
 sounddevice>=0.4.6
 tkinterdnd2>=0.4.2
+pystray>=0.19.5
+Pillow>=10.4.0
+# GPU 转写（NVIDIA CUDA 12 + cuDNN 9，ctranslate2 运行时需要，约 1GB）
+nvidia-cublas-cu12>=12.4.5
+nvidia-cudnn-cu12>=9.1.0

@@ -22,7 +22,7 @@ from . import errors
 from .asr import WhisperASR
 from .config import AppSettings
 from .export import export_result
-from .models import JobEvent, JobOptions, JobResult, RefineOptions, RefineResult
+from .models import JobEvent, JobOptions, JobResult, RefineOptions, RefineResult, Transcript
 from .refine import DeepSeekRefiner
 from .util import human_duration, sanitize_filename
 
@@ -34,7 +34,8 @@ Emit = Callable[[JobEvent], None]
 def _default_asr_factory(settings: AppSettings) -> WhisperASR:
     return WhisperASR(
         model_size=settings.asr_model,
-        compute_type=settings.compute_type,
+        device=settings.effective_device(),
+        compute_type=settings.effective_compute_type(),
         cpu_threads=settings.effective_threads(),
         model_dir=str(settings.resolve_model_dir()),
         beam_size=settings.beam_size,
@@ -169,6 +170,7 @@ class Pipeline:
         job: JobOptions,
         emit: Emit,
         cancel: threading.Event,
+        on_transcript: Optional[Callable[[Transcript], None]] = None,
     ) -> JobResult:
         """阶段 1+2：本地转写 + DeepSeek 整理，返回未导出的结果。"""
         # ---------- 1. 语音转写 ----------
@@ -208,6 +210,13 @@ class Pipeline:
             )
         if cancel.is_set():
             raise errors.CancelledError("任务已取消")
+
+        # 先把「原始转写」交给界面，让用户更早看到文字（随后再用整理稿替换）
+        if on_transcript is not None:
+            try:
+                on_transcript(transcript)
+            except Exception:  # 回调异常不应中断主流程
+                log.warning("on_transcript 回调执行失败", exc_info=True)
 
         # ---------- 2. DeepSeek 整理 ----------
         refined: Optional[RefineResult] = None
@@ -317,14 +326,21 @@ class Pipeline:
         job: JobOptions,
         emit: Emit,
         cancel: Optional[threading.Event] = None,
+        on_transcript: Optional[Callable[[Transcript], None]] = None,
     ) -> JobResult:
-        """快速语音输入：转写 + 整理，不写任何文件（结果直接交给界面）。"""
+        """快速语音输入：转写 + 整理，不写任何文件（结果直接交给界面）。
+
+        :param on_transcript: 可选回调；ASR 完成、DeepSeek 开始前调用，
+            用于界面先把原始转写显示出来（降低等待感）。
+        """
         cancel = cancel or threading.Event()
         audio = self._prepare_audio(audio_path, emit, cancel)
         self._busy = True
         started = time.monotonic()
         try:
-            result = self._transcribe_and_refine(audio, job, emit, cancel)
+            result = self._transcribe_and_refine(
+                audio, job, emit, cancel, on_transcript=on_transcript
+            )
             result.elapsed = time.monotonic() - started
             emit(
                 JobEvent(
@@ -343,6 +359,23 @@ class Pipeline:
     # ------------------------------------------------------------------
     # 资源管理
     # ------------------------------------------------------------------
+    def warm_up(self, cancel: Optional[threading.Event] = None) -> bool:
+        """在后台线程预加载识别模型（不转写），降低第一次口述的等待。
+
+        失败只记录日志并返回 ``False``（例如 GPU 环境异常），不抛出异常，
+        真正使用时仍会再次尝试加载并给出中文错误提示。
+        """
+        try:
+            asr = self._get_asr()
+            loader = getattr(asr, "ensure_loaded", None)
+            if loader is not None:
+                loader(None, cancel or threading.Event())
+            self._last_activity = time.monotonic()
+            return True
+        except Exception:
+            log.warning("识别模型预热失败，将在首次使用时重试", exc_info=True)
+            return False
+
     @property
     def busy(self) -> bool:
         return self._busy
