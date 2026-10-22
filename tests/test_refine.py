@@ -58,7 +58,7 @@ def make_refiner(server: MockAPIServer, **overrides) -> DeepSeekRefiner:
     kwargs = dict(
         api_key=TEST_KEY,
         base_url=server.url,
-        model="deepseek-chat",
+        model="deepseek-flash",
         timeout=10.0,
         max_retries=2,
     )
@@ -173,7 +173,8 @@ def test_single_chunk_success(server, refiner, sample_transcript):
     assert request.headers.get("authorization", "").startswith("Bearer ")
 
     payload = request.json
-    assert payload["model"] == "deepseek-chat"
+    assert payload["model"] == "deepseek-flash"
+    assert payload["thinking"] == {"type": "disabled"}
     assert payload["stream"] is False
     assert payload["max_tokens"] == MAX_OUTPUT_TOKENS
     assert payload["max_tokens"] == 4096

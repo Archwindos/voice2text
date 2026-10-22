@@ -412,6 +412,30 @@ def test_home_minimal_layout_and_half_wave(gui_env):
         _close_window(window)
 
 
+def test_settings_model_shared_with_file_page(gui_env):
+    """设置里的「识别模型」是语音输入/文件转写共用的唯一设置。"""
+    root, window = _make_window(gui_env)
+    try:
+        from voxscribe.config import ASR_MODELS
+        from voxscribe.gui.dialogs import SettingsDialog
+
+        dialog = SettingsDialog(
+            root,
+            settings=window.settings,
+            pipeline=window.pipeline,
+            theme=window.theme,
+        )
+        dialog.model_var.set(ASR_MODELS["base"])
+        dialog._on_save()
+        root.update()
+        assert window.settings.asr_model == "base"
+        # 文件转写页的模型下拉在设置保存后同步为同一个值
+        window._apply_settings_to_ui()
+        assert window._current_model_key() == "base"
+    finally:
+        _close_window(window)
+
+
 def test_no_api_key_degrades_to_local_transcribe(gui_env, monkeypatch):
     root, window = _make_window(gui_env, api_key=None)
     captured = _patch_pipeline(window, monkeypatch, refined=False)

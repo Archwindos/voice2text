@@ -4,7 +4,7 @@
 
     refiner = DeepSeekRefiner(api_key="sk-...",
                               base_url="https://api.deepseek.com",
-                              model="deepseek-chat",
+                              model="deepseek-flash",
                               timeout=120, max_retries=2)
     refiner.refine(transcript, RefineOptions(...),
                    on_progress=callable(ratio, message),
@@ -161,7 +161,7 @@ def _extract_content(data: Any) -> str:
         raise RefineError(
             "DeepSeek 返回结果缺少内容（choices 为空）",
             hint="请稍后重试；若持续出现，请检查「设置」中的模型名称是否正确"
-            "（一般填 deepseek-chat）。",
+            "（一般填 deepseek-flash）。",
         )
     first = choices[0]
     message = first.get("message") if isinstance(first, dict) else None
@@ -263,14 +263,17 @@ class DeepSeekRefiner:
         *,
         api_key: str,
         base_url: str = DEFAULT_BASE_URL,
-        model: str = "deepseek-chat",
+        model: str = "deepseek-flash",
         timeout: float = 120.0,
         max_retries: int = 2,
+        thinking_disabled: bool = True,
     ) -> None:
         self._api_key = (api_key or "").strip()
         self.base_url = normalize_base_url(base_url)
         self.chat_url = self.base_url + CHAT_COMPLETIONS_PATH
-        self.model = (model or "deepseek-chat").strip() or "deepseek-chat"
+        self.model = (model or "deepseek-flash").strip() or "deepseek-flash"
+        # True = 请求体带 thinking: {"type": "disabled"}，关闭思考模式（低延迟）
+        self.thinking_disabled = bool(thinking_disabled)
 
         timeout_value = _safe_float(timeout, 120.0)
         if timeout_value <= 0:
@@ -449,6 +452,12 @@ class DeepSeekRefiner:
             "max_tokens": int(max_tokens),
             "stream": False,
         }
+        if self.thinking_disabled:
+            # 仅对支持「思考开关」的新模型发送该参数；旧模型（如 deepseek-chat）
+            # 收到 thinking 字段可能直接 400，因此按模型名判断。
+            model_lower = self.model.lower()
+            if "flash" in model_lower or "v4" in model_lower:
+                payload["thinking"] = {"type": "disabled"}
         max_attempts = self.max_retries + 1
         attempt = 0
 

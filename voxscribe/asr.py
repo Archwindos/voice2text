@@ -262,6 +262,10 @@ def _default_site_package_roots() -> List[Path]:
         import site as site_module  # 标准库
 
         candidates.extend(site_module.getsitepackages())
+        try:
+            candidates.append(site_module.getusersitepackages())
+        except Exception:  # pragma: no cover - 极端环境
+            pass
     except Exception:  # pragma: no cover - 极少数嵌入式环境
         log.debug("无法通过 site.getsitepackages() 定位依赖目录", exc_info=True)
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -271,6 +275,23 @@ def _default_site_package_roots() -> List[Path]:
             str(Path(sys.prefix) / "lib" / version / "site-packages"),  # Linux/macOS
         ]
     )
+    # 桌面快捷方式用基础 pythonw 启动（sys.prefix 指向基础解释器）时，
+    # 依赖目录由 VIRTUAL_ENV / PYTHONPATH 注入，这里显式补上。
+    venv_dir = os.environ.get("VIRTUAL_ENV", "").strip()
+    if venv_dir:
+        candidates.extend(
+            [
+                str(Path(venv_dir) / "Lib" / "site-packages"),
+                str(Path(venv_dir) / "lib" / version / "site-packages"),
+            ]
+        )
+    for entry in sys.path:
+        try:
+            path = Path(entry)
+            if path.name.lower() == "site-packages":
+                candidates.append(str(path))
+        except (OSError, TypeError):
+            continue
     roots: List[Path] = []
     seen: set[str] = set()
     for candidate in candidates:

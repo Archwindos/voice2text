@@ -26,7 +26,7 @@ Alt+~ 开始说话 → GPU 本地转写（0.5~1 秒）→ 立即显示原始文�
 
 ## 二、关于「DeepSeek 的语音模型」
 
-DeepSeek 官方 API 目前**只提供文本模型**（`deepseek-chat`、`deepseek-reasoner`），
+DeepSeek 官方 API 提供文本模型（当前为 `deepseek-flash`（V4.1 Flash）、`deepseek-v4-pro`），
 没有公开的语音识别（ASR）接口；DeepSeek App 里的语音输入使用的是第三方技术，不对外开放。
 
 所以本项目这样分工，各取所长：
@@ -34,9 +34,10 @@ DeepSeek 官方 API 目前**只提供文本模型**（`deepseek-chat`、`deepsee
 | 环节 | 用什么 | 为什么 |
 | --- | --- | --- |
 | 语音 → 文字 | **本地 faster-whisper，跑在 N 卡 GPU 上**（CUDA float16） | 免费、离线、隐私；GPU 上比 CPU 快约 4~9 倍 |
-| 文字 → 书面语 | **DeepSeek API（deepseek-chat，非思考模式）** | 中文表达质量高、能纠错别字、响应快、价格低 |
+| 文字 → 书面语 | **DeepSeek API（deepseek-flash，关闭思考模式）** | 中文表达质量高、能纠错别字、响应快、价格低 |
 
-> DeepSeek 整理固定使用 `deepseek-chat` **非思考模式**（不走 reasoner），保证口述后快速出结果。
+> DeepSeek 整理默认使用 **`deepseek-flash`（V4.1 Flash）并关闭思考模式**（请求体 `thinking: {"type": "disabled"}`），不做推理、直接输出正文，保证口述后快速出结果。
+> 可在设置里改模型名；换成旧模型时会自动不发送 thinking 参数，避免 400 错误。
 > 如果以后想接入云端语音识别，`voxscribe/asr.py` 是独立模块，替换掉即可。
 
 ## 三、功能特性
@@ -48,6 +49,7 @@ DeepSeek 官方 API 目前**只提供文本模型**（`deepseek-chat`、`deepsee
 - **极速出字**：GPU 转写完成后**先把原始文字显示出来**（状态显示「已转写，正在 DeepSeek 润色…」），DeepSeek 整理完再用最终稿替换——不用盯着空白等全程。
 - **自动语言检测**：默认自动识别中/英文——说英文就输出英文，**不会被翻译成中文**；中英混说时英文单词保持原样。
 - **自动复制**：设置里可开启「完成后自动复制到剪贴板」（默认开），最终稿直接到剪贴板。
+- **识别模型统一设置**：设置 → 识别与性能 →「识别模型」，语音输入和文件转写共用这一个设置，不会出现两个页面对不上的情况。
 - **麦克风可选 + 无声提醒**：设置里可以选择具体麦克风（默认系统设备）；录音 1.5 秒仍没有检测到声音会直接提示「请检查麦克风是否静音/选错设备」，不会让你对着空气说话还不知道。
 - **麦克风采样率自适应**：16kHz 不支持的设备（不少 USB/蓝牙麦克风）会自动改用设备默认采样率（44.1/48kHz），接上就能用。
 - **结果可编辑**：转换后可以顺手改两个词，再点「复制文字」或按 `Ctrl+Enter`。
@@ -177,7 +179,7 @@ DeepSeek 官方 API 目前**只提供文本模型**（`deepseek-chat`、`deepsee
 | **`medium`** | ~1.5GB | ~1.9GB | **很好** | **快（0.7s/13s 音频）** | **默认推荐** |
 | `large-v3` | ~3.1GB | ~3GB | 最好 | 中等 | 8GB 显卡可尝试，一般不必 |
 
-> 在「文件转写」页的「识别模型」下拉里切换；本机已缓存 tiny / small / medium（共约 2GB，无需再下载）。
+> 在「设置 → 识别与性能 → 识别模型」里切换（语音输入与文件转写共用）；本机已缓存 tiny / small / medium（共约 2GB，无需再下载）。
 > 模型缓存在 `data/models/`，删除即清理。
 
 ## 八、导出格式（文件转写页）
@@ -227,7 +229,8 @@ DeepSeek 官方 API 目前**只提供文本模型**（`deepseek-chat`、`deepsee
 | `preload_model` | 启动时后台预热识别模型 | `true` |
 | `close_to_tray` | 关闭/最小化时隐藏到托盘待机 | `true` |
 | `api_base_url` | DeepSeek 接口地址（可填兼容代理） | `https://api.deepseek.com` |
-| `api_model` | 文本整理模型（保持 deepseek-chat 即非思考模式） | `deepseek-chat` |
+| `api_model` | 文本整理模型 | `deepseek-flash` |
+| `api_thinking_disabled` | 关闭思考模式（`true`=直接输出正文，最快） | `true` |
 | `api_key_enc` | 加密后的 API Key（勿手工修改） | 空 |
 | `refine_by_default` | 文件页默认开启 AI 整理 | `true` |
 | `default_style` | 文件页默认整理风格 | `oral` |
@@ -308,6 +311,13 @@ v1.3.1 起默认语言为「自动检测」：英文语音会输出英文，不�
 
 **14. 桌面快捷方式丢了 / 换电脑了？**
 运行 `tools\create_shortcut.ps1` 会在桌面重新创建「语声成文 VoxScribe」快捷方式；重新运行 `setup.bat` 也会自动创建。
+
+**15. 为什么用 deepseek-flash，不用 chat？**
+当前 DeepSeek 最新是 V4.1 Flash（模型 ID `deepseek-flash`）。本软件默认**关闭思考模式**（`thinking: {"type": "disabled"}`），整理一句话通常 0.5~1 秒完成；`deepseek-chat` 是旧模型，速度和效果都不如 V4.1 Flash。
+如果以后要换别的模型，在设置里改「模型名」即可；旧模型不会收到 thinking 参数。
+
+**16. 桌面快捷方式启动时报 CUDA/cublas 错误？**
+v1.3.3 起桌面快捷方式使用自带的 `VoxScribe.exe` 无黑框启动器，会自动读取 venv 依赖目录；如仍报 CUDA 错误，先运行一次 `setup.bat` 补装 CUDA 运行库。
 
 ## 十三、项目结构
 

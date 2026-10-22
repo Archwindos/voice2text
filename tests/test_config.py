@@ -14,7 +14,8 @@ from voxscribe.config import AppSettings
 def test_defaults() -> None:
     settings = AppSettings()
     assert settings.asr_model == "medium"
-    assert settings.api_model == "deepseek-chat"
+    assert settings.api_model == "deepseek-flash"
+    assert settings.api_thinking_disabled is True  # 默认关闭思考模式（低延迟）
     assert settings.api_base_url.startswith("https://")
     assert settings.language == "auto"  # 默认自动检测，中英混说不会被强制翻译
     assert 1 <= settings.effective_threads() <= 4

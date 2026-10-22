@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Callable, Optional, Tuple
 
-from ..config import AppSettings, default_output_dir
+from ..config import ASR_MODELS, AppSettings, default_output_dir
 from ..errors import VoxError
 from ..pipeline import Pipeline
 from .hotkey import HOTKEY_LABEL
@@ -208,7 +208,7 @@ class SettingsDialog(tk.Toplevel):
         ttk.Entry(deepseek_body, textvariable=self.api_model_var).grid(
             row=3, column=1, sticky="ew", pady=theme.px(4)
         )
-        _card_label(deepseek_body, theme, "默认 deepseek-chat", muted=True).grid(
+        _card_label(deepseek_body, theme, "默认 deepseek-flash（非思考）", muted=True).grid(
             row=3, column=2, sticky="w", padx=(theme.px(8), 0)
         )
 
@@ -262,8 +262,25 @@ class SettingsDialog(tk.Toplevel):
         ).grid(row=0, column=3, sticky="w", pady=theme.px(4))
 
         perf_hint = (
-            "线程数 0 = 自动（最多 4 线程，尽量不抢满 CPU）；"
-            "空闲卸载 0 = 常驻不卸载（默认，保证口述速度），>0 表示空闲该分钟数后释放模型内存。"
+            "线程数 0=自动（最多4）；空闲卸载 0=常驻，>0=空闲该分钟数后释放模型。"
+        )
+
+        # 识别模型（语音输入与文件转写共用这一个设置）
+        self._model_keys = list(ASR_MODELS)
+        self._model_values = [ASR_MODELS[key] for key in self._model_keys]
+        self.model_var = tk.StringVar()
+        _card_label(perf_body, theme, "识别模型").grid(
+            row=1, column=0, sticky="w", padx=(0, theme.px(10)), pady=(theme.px(8), 0)
+        )
+        self.model_combo = ttk.Combobox(
+            perf_body,
+            textvariable=self.model_var,
+            values=self._model_values,
+            state="readonly",
+            width=40,
+        )
+        self.model_combo.grid(
+            row=1, column=1, columnspan=3, sticky="w", pady=(theme.px(8), 0)
         )
 
         # 麦克风设备选择（默认 = 系统默认输入设备）
@@ -285,17 +302,17 @@ class SettingsDialog(tk.Toplevel):
         except Exception:  # pragma: no cover - 无录音环境
             log.debug("枚举麦克风设备失败", exc_info=True)
         _card_label(perf_body, theme, "麦克风设备").grid(
-            row=1, column=0, sticky="w", padx=(0, theme.px(10)), pady=(theme.px(8), 0)
+            row=2, column=0, sticky="w", padx=(0, theme.px(10)), pady=(theme.px(8), 0)
         )
         self.mic_combo = ttk.Combobox(
             perf_body,
             textvariable=self.mic_var,
             values=mic_values,
             state="readonly",
-            width=36,
+            width=40,
         )
         self.mic_combo.grid(
-            row=1, column=1, columnspan=3, sticky="w", pady=(theme.px(8), 0)
+            row=2, column=1, columnspan=3, sticky="w", pady=(theme.px(8), 0)
         )
 
         # 语音输入行为（收纳进「识别与性能」卡片，减少界面区块）
@@ -307,7 +324,7 @@ class SettingsDialog(tk.Toplevel):
             text="完成后自动复制到剪贴板",
             variable=self.auto_copy_var,
             style="Card.TCheckbutton",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(theme.px(8), 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(theme.px(8), 0))
         self.close_to_tray_var = tk.BooleanVar(
             value=bool(getattr(self.settings, "close_to_tray", True))
         )
@@ -316,17 +333,17 @@ class SettingsDialog(tk.Toplevel):
             text="关闭/最小化时隐藏到托盘",
             variable=self.close_to_tray_var,
             style="Card.TCheckbutton",
-        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(theme.px(8), 0))
+        ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(theme.px(8), 0))
         _card_label(
-            perf_body, theme, perf_hint, muted=True, wraplength=theme.px(500)
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(theme.px(6), 0))
+            perf_body, theme, perf_hint, muted=True, wraplength=theme.px(520)
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(theme.px(6), 0))
 
         # --- 术语表 ---
         glossary_card, glossary_body = make_card(outer, theme, "术语表（可选）")
         glossary_card.pack(fill="x", pady=(0, theme.px(8)))
         self.glossary_text = tk.Text(
             glossary_body,
-            height=3,
+            height=2,
             wrap="word",
             font=theme.font(UI_SIZE),
             bg=COLORS["input_bg"],
@@ -401,7 +418,10 @@ class SettingsDialog(tk.Toplevel):
         self.api_key_var.set("")
         self._update_key_state()
         self.base_url_var.set(settings.api_base_url or "https://api.deepseek.com")
-        self.api_model_var.set(settings.api_model or "deepseek-chat")
+        self.api_model_var.set(settings.api_model or "deepseek-flash")
+        self.model_var.set(
+            ASR_MODELS.get(settings.asr_model, ASR_MODELS.get("medium", ""))
+        )
         self.threads_var.set(str(int(settings.cpu_threads or 0)))
         self.idle_var.set(str(int(settings.idle_unload_minutes or 0)))
         self.output_var.set(
@@ -493,7 +513,7 @@ class SettingsDialog(tk.Toplevel):
             )
             return
         base_url = self.base_url_var.get().strip() or "https://api.deepseek.com"
-        model = self.api_model_var.get().strip() or "deepseek-chat"
+        model = self.api_model_var.get().strip() or "deepseek-flash"
         self._test_running = True
         self.test_button.configure(state="disabled", text="测试中…")
         threading.Thread(
@@ -583,7 +603,7 @@ class SettingsDialog(tk.Toplevel):
                 parent=self,
             )
             return
-        model = self.api_model_var.get().strip() or "deepseek-chat"
+        model = self.api_model_var.get().strip() or "deepseek-flash"
 
         raw_output = self.output_var.get().strip()
         output_path: Optional[Path] = None
@@ -615,6 +635,12 @@ class SettingsDialog(tk.Toplevel):
         self.settings.close_to_tray = bool(self.close_to_tray_var.get())
         self.settings.auto_copy = bool(self.auto_copy_var.get())
         self.settings.glossary = self.glossary_text.get("1.0", "end-1c").strip()
+        # 识别模型：语音输入与文件转写共用这一个设置
+        model_choice = self.model_var.get().strip()
+        for key, label in ASR_MODELS.items():
+            if label == model_choice:
+                self.settings.asr_model = key
+                break
         mic_choice = self.mic_var.get().strip()
         self.settings.input_device = (
             "" if mic_choice in ("", "默认输入设备") else mic_choice

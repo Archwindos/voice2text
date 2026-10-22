@@ -40,7 +40,7 @@ from voxscribe.models import STYLES, RefineOptions, Segment, Transcript  # noqa:
 from voxscribe.refine import DeepSeekRefiner  # noqa: E402
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_MODEL = "deepseek-flash"
 KEY_ENV_NAMES = ("VOXSCRIBE_API_KEY", "DEEPSEEK_API_KEY")
 
 

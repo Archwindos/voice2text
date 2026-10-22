@@ -48,7 +48,7 @@ def chat_response(
     content: str,
     *,
     usage: Optional[Dict[str, int]] = None,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-flash",
     finish_reason: str = "stop",
 ) -> Dict[str, Any]:
     """构造一份 OpenAI 兼容的 chat.completion 响应体。"""
