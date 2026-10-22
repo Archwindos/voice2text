@@ -285,7 +285,9 @@ def test_hotkey_starts_and_stops_recording(gui_env, monkeypatch):
         # F2 绑定已移除，改由全局 Alt+~ 轮询
         assert not window.root.bind("<F2>")
         assert window._hotkey is not None
-        assert "Alt+~" in window.home_record_btn.cget("text")
+        # 空闲时只保留一句提示（含 Alt+~），不再显示模式小字
+        assert "Alt+~" in window.home_status_var.get()
+        assert not hasattr(window, "home_mode_var")
 
         window._on_hotkey()  # 模拟按下 Alt+~
         root.update()
@@ -295,7 +297,7 @@ def test_hotkey_starts_and_stops_recording(gui_env, monkeypatch):
         window._on_hotkey()
         _wait_idle(window)
         assert FAKE_REFINED in window._get_home_text()
-        assert "AI 已整理" in window.home_status_var.get()
+        assert "AI 已整理" in window.home_result_info_var.get()
         assert gui_env["dialogs"] == []
     finally:
         _close_window(window)
@@ -368,13 +370,37 @@ def test_auto_copy_disabled_keeps_clipboard(gui_env, monkeypatch):
         window.root.clipboard_clear()
         window.root.clipboard_append("KEEP-ME")
         window.root.update()
-        assert window.auto_copy_var.get() is False
+        assert window.settings.auto_copy is False
 
         _run_quick_flow(window)
 
         assert FAKE_REFINED in window._get_home_text()
-        assert "已复制" not in window.home_status_var.get()
+        assert "已复制" not in window.home_result_info_var.get()
         assert window.root.clipboard_get() == "KEEP-ME"
+    finally:
+        _close_window(window)
+
+
+def test_home_minimal_layout_and_half_wave(gui_env):
+    """v1.3：模式小字移除、波形非对称半高、结果区元信息+按钮收敛。"""
+    root, window = _make_window(gui_env)
+    try:
+        # 模式小字整行移除
+        assert not hasattr(window, "home_mode_var")
+        assert not hasattr(window, "home_mode_label")
+        # 波形高度压缩到约 80~100（96dpi 设计值，随 DPI 缩放）
+        wave_height = int(window.wave_canvas.cget("height"))
+        assert 60 <= wave_height <= 160, wave_height
+        # 空闲波形区内不再有小字（只有基线与刻度线）
+        window._draw_home_idle()
+        types = {window.wave_canvas.type(item) for item in window.wave_canvas.find_all()}
+        assert "text" not in types, types
+        # 结果区标题行右侧元信息 + 复制/清空按钮（无文字时禁用）
+        assert window.home_result_info_var.get() == ""
+        assert window.home_copy_btn.cget("state") == "disabled"
+        assert window.home_clear_btn.cget("state") == "disabled"
+        # 底部状态栏不再显示内存（memory_var 仍保留给集成测试）
+        assert "内存" in window.memory_var.get()
     finally:
         _close_window(window)
 
@@ -389,9 +415,9 @@ def test_no_api_key_degrades_to_local_transcribe(gui_env, monkeypatch):
         assert captured["job"].refine is False
         assert captured["job"].style == "proofread"
         assert window._get_home_text() == FAKE_RAW
-        status = window.home_status_var.get()
-        assert "仅本地转写" in status
-        assert "已整理" not in status
+        meta = window.home_result_info_var.get()
+        assert "仅本地转写" in meta
+        assert "已整理" not in meta
         assert "未配置" in window.home_inline_hint.cget("text")
         assert gui_env["dialogs"] == []
     finally:
@@ -763,5 +789,45 @@ def test_settings_dialog_accepts_new_key_and_tray_option(gui_env):
         assert raw["api_key_enc"].startswith("dpapi:")
         assert "sk-new-key-456" not in json.dumps(raw, ensure_ascii=False)
         assert raw["close_to_tray"] is False
+    finally:
+        _close_window(window)
+
+
+def test_settings_dialog_auto_copy_option(gui_env):
+    """v1.3：自动复制开关从首页移到设置对话框。"""
+    gui_app = gui_env["gui_app"]
+    from voxscribe.config import AppSettings
+    from voxscribe.gui.dialogs import SettingsDialog
+
+    tmp_path = gui_env["tmp_path"]
+    settings = AppSettings(
+        first_run_done=True,
+        model_dir=str(tmp_path / "models"),
+        output_dir=str(tmp_path / "out"),
+        window_geometry="",
+        auto_copy=True,
+    )
+    root = gui_app._create_root()
+    window = gui_app.MainWindow(root, settings)
+    try:
+        dialog = SettingsDialog(
+            root,
+            settings=settings,
+            pipeline=window.pipeline,
+            theme=window.theme,
+        )
+        assert dialog.auto_copy_var.get() is True
+        # 首页不再有自动复制控件
+        assert not hasattr(window, "auto_copy_var")
+        dialog.auto_copy_var.set(False)
+        dialog._on_save()
+        root.update()
+        assert settings.auto_copy is False
+        raw = json.loads(
+            (Path(gui_env["tmp_path"]) / "data" / "config.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert raw["auto_copy"] is False
     finally:
         _close_window(window)

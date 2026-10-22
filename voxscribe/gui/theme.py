@@ -49,6 +49,13 @@ COLORS: Dict[str, str] = {
     "wave_old": "#c9d9f5",
     "wave_new": "#2563eb",
     "wave_frozen": "#dbe6f7",
+    # v1.3 新布局复用色（保持浅色主题）
+    "bg_alt": "#eef2f8",
+    "card_alt": "#f8fafc",
+    "border_bright": "#c3cfdf",
+    "primary_ink": "#ffffff",
+    "selection": "#dbeafe",
+    "grid": "#e6ebf4",
 }
 
 _FONT_CANDIDATES = (
@@ -62,7 +69,7 @@ _MONO_CANDIDATES = ("Consolas", "Cascadia Mono", "Courier New", "TkFixedFont")
 
 UI_SIZE = 10          # 界面常规字号（磅）
 SMALL_SIZE = 9        # 辅助说明
-BODY_SIZE = 11        # 预览正文
+BODY_SIZE = 12        # 结果正文（v1.3 放大）
 
 
 def _pick_font(root: tk.Misc, candidates: Tuple[str, ...], fallback: str) -> str:
@@ -122,8 +129,8 @@ class Theme:
     def font(self, size: int = UI_SIZE, weight: str = "normal") -> Tuple[str, int, str]:
         return (self.family, int(size), weight)
 
-    def mono(self, size: int = SMALL_SIZE) -> Tuple[str, int, str]:
-        return (self.mono_family, int(size), "normal")
+    def mono(self, size: int = SMALL_SIZE, weight: str = "normal") -> Tuple[str, int, str]:
+        return (self.mono_family, int(size), weight)
 
     # -- 样式 ---------------------------------------------------------
     def apply(self) -> None:

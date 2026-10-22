@@ -280,8 +280,9 @@ def test_home_page_quick_dictation_flow(
             text = window._get_home_text()
             assert any(key in text for key in ("项目", "进度", "前端", "后端")), text
             assert server.request_count == 1, "语音输入没有调用 mock DeepSeek 整理"
-            assert "已整理" in window.home_status_var.get()
-            assert "已复制" in window.home_status_var.get()
+            meta = window.home_result_info_var.get()
+            assert "已整理" in meta
+            assert "已复制" in meta
 
             clipboard = root.clipboard_get()
             assert text in clipboard
@@ -349,9 +350,9 @@ def test_home_page_quick_dictation_without_api_key(
             text = window._get_home_text()
             assert any(key in text for key in ("项目", "进度", "前端", "后端")), text
             assert server.request_count == 0, "无 Key 时不应调用 DeepSeek"
-            status = window.home_status_var.get()
-            assert "转写" in status
-            assert "仅本地转写" in status or "未配置" in status
+            meta = window.home_result_info_var.get()
+            assert "转写" in meta
+            assert "仅本地转写" in meta or "未配置" in meta
         finally:
             if window is not None:
                 window._on_close()

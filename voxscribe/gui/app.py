@@ -77,9 +77,10 @@ QUICK_STYLE = "proofread"
 QUICK_STYLE_LABEL = STYLES.get(QUICK_STYLE, "口述校对")
 HOME_PLACEHOLDER = "转换后的文字会出现在这里，可直接复制或修改"
 FULL_WIDTH_SPACE = "\u3000"
-START_BUTTON_TEXT = f"● 开始录音{FULL_WIDTH_SPACE}{HOTKEY_LABEL}"
-STOP_BUTTON_TEXT = f"■ 停止并转换{FULL_WIDTH_SPACE}{HOTKEY_LABEL}"
+START_BUTTON_TEXT = "● 开始录音"
+STOP_BUTTON_TEXT = "■ 停止并转换"
 CONVERTING_BUTTON_TEXT = "转换中…"
+HOME_IDLE_HINT = f"按 {HOTKEY_LABEL} 说一段，再按一次结束"
 
 AUDIO_EXTENSIONS = frozenset(
     {
@@ -247,7 +248,6 @@ class MainWindow:
         self._level_history: List[float] = []
         self._wave_job: Optional[str] = None
         self._wave_phase = 0
-        self._wave_idle_hint = ""
         self._home_placeholder = True
 
         # ---- 通用 ----
@@ -288,7 +288,6 @@ class MainWindow:
         self._refresh_file_list()
         self._bind_shortcuts()
         self._set_home_timer(None)
-        self._set_home_mode_hint()
         self._draw_home_idle()
         self._init_hotkey()
 
@@ -396,42 +395,43 @@ class MainWindow:
     def _build_header(self, root: tk.Tk) -> None:
         theme = self.theme
         colors = COLORS
-        header = tk.Frame(root, bg=colors["header"], height=theme.px(72))
+        header = tk.Frame(root, bg=colors["header"], height=theme.px(54))
         header.grid(row=0, column=0, sticky="ew")
         header.pack_propagate(False)
+        tk.Frame(root, bg=colors["border"], height=1).grid(
+            row=0, column=0, sticky="sew"
+        )
 
         brand = tk.Frame(header, bg=colors["header"])
-        brand.pack(side="left", padx=(theme.px(22), 0), pady=theme.px(10))
-        title_row = tk.Frame(brand, bg=colors["header"])
-        title_row.pack(anchor="w")
+        brand.pack(side="left", padx=(theme.px(22), 0), pady=theme.px(9))
         tk.Label(
-            title_row,
+            brand,
             text=APP_DISPLAY_NAME,
             bg=colors["header"],
             fg=colors["header_fg"],
-            font=theme.font(16, "bold"),
+            font=theme.font(14, "bold"),
         ).pack(side="left")
         tk.Label(
-            title_row,
+            brand,
             text="VoxScribe",
             bg=colors["header"],
-            fg=colors["header_sub"],
-            font=theme.font(11),
-        ).pack(side="left", padx=(theme.px(8), 0), pady=(theme.px(4), 0))
+            fg=colors["primary"],
+            font=theme.font(SMALL_SIZE, "bold"),
+        ).pack(side="left", padx=(theme.px(8), 0), pady=(theme.px(2), 0))
         tk.Label(
             brand,
             text=APP_SUBTITLE,
             bg=colors["header"],
-            fg=colors["header_sub"],
+            fg=colors["faint"],
             font=theme.font(SMALL_SIZE),
-        ).pack(anchor="w", pady=(theme.px(1), 0))
+        ).pack(side="left", padx=(theme.px(16), 0), pady=(theme.px(2), 0))
 
         header_actions = tk.Frame(header, bg=colors["header"])
-        header_actions.pack(side="right", padx=(0, theme.px(18)), pady=theme.px(10))
+        header_actions.pack(side="right", padx=(0, theme.px(16)), pady=theme.px(8))
         self.help_btn = self._header_button(header_actions, "帮助", self._open_help)
-        self.help_btn.pack(side="right", padx=(theme.px(6), 0))
+        self.help_btn.pack(side="right", padx=(theme.px(4), 0))
         self.settings_btn = self._header_button(header_actions, "设置", self._open_settings)
-        self.settings_btn.pack(side="right", padx=(theme.px(6), 0))
+        self.settings_btn.pack(side="right", padx=(theme.px(4), 0))
 
     def _build_nav(self, root: tk.Tk) -> None:
         theme = self.theme
@@ -494,7 +494,7 @@ class MainWindow:
         if page == "home":
             self.file_page.grid_remove()
             self.home_page.grid()
-            self._draw_home_idle(self._wave_idle_hint or None)
+            self._draw_home_idle()
         else:
             self.home_page.grid_remove()
             self.file_page.grid()
@@ -510,10 +510,10 @@ class MainWindow:
             text=text,
             command=command,
             bg=colors["header"],
-            fg="#f7b0b0" if accent else colors["header_sub"],
+            fg=colors["danger"] if accent else colors["header_sub"],
             activebackground=colors["header_soft"],
             activeforeground=colors["header_fg"],
-            disabledforeground="#7f8ea3",
+            disabledforeground=colors["faint"],
             font=theme.font(UI_SIZE, "bold" if accent else "normal"),
             relief="flat",
             bd=0,
@@ -536,11 +536,11 @@ class MainWindow:
         colors = COLORS
         if accent:
             bg, fg = colors["primary_light"], colors["primary_dark"]
-            active_bg, active_fg = "#dbeafe", colors["primary_dark"]
-            border = "#bfdbfe"
+            active_bg, active_fg = colors["primary_light"], colors["primary"]
+            border = colors["primary_light"]
         elif danger:
             bg, fg = colors["card"], colors["muted"]
-            active_bg, active_fg = "#fef2f2", colors["danger"]
+            active_bg, active_fg = colors["record_soft"], colors["danger"]
             border = colors["border"]
         else:
             bg, fg = colors["card"], colors["text"]
@@ -578,15 +578,15 @@ class MainWindow:
         theme = self.theme
         colors = COLORS
         if primary:
-            bg, fg = colors["primary"], "#ffffff"
-            active_bg, active_fg = colors["primary_dark"], "#ffffff"
-            border = colors["primary_dark"]
+            bg, fg = colors["primary"], colors["primary_ink"]
+            active_bg, active_fg = colors["primary_dark"], colors["primary_ink"]
+            border = colors["primary"]
         elif danger:
             bg, fg = colors["card"], colors["danger"]
-            active_bg, active_fg = "#fef2f2", colors["danger"]
-            border = "#f0c9c9"
+            active_bg, active_fg = colors["record_soft"], colors["danger"]
+            border = colors["border"]
         else:
-            bg, fg = colors["card"], colors["text"]
+            bg, fg = colors["card_alt"], colors["text"]
             active_bg, active_fg = colors["primary_light"], colors["primary_dark"]
             border = colors["border"]
         return tk.Button(
@@ -616,7 +616,7 @@ class MainWindow:
         variable: tk.BooleanVar,
         command: Any = None,
     ) -> tk.Checkbutton:
-        """白色卡片上的经典复选框（比 clam 主题的 ✕ 样式更直观）。"""
+        """卡片上的复选框（深色背景 + 经典勾选）。"""
         theme = self.theme
         colors = COLORS
         return tk.Checkbutton(
@@ -628,7 +628,7 @@ class MainWindow:
             fg=colors["text"],
             activebackground=colors["card"],
             activeforeground=colors["text"],
-            selectcolor=colors["card"],
+            selectcolor=colors["input_bg"],
             disabledforeground=colors["faint"],
             font=theme.font(UI_SIZE),
             bd=0,
@@ -648,7 +648,7 @@ class MainWindow:
         page.rowconfigure(0, weight=0)
         page.rowconfigure(1, weight=1)
 
-        # ---------- 录音 + 波形 ----------
+        # ---------- 录音控制 + 半高波形（非对称：基线在底部，只向上生长） ----------
         input_card, input_body = theme_module.make_card(page, theme)
         input_card.grid(row=0, column=0, sticky="ew")
 
@@ -657,94 +657,137 @@ class MainWindow:
             text=START_BUTTON_TEXT,
             command=self._toggle_quick,
             bg=colors["primary"],
-            fg="#ffffff",
+            fg=colors["primary_ink"],
             activebackground=colors["primary_dark"],
-            activeforeground="#ffffff",
-            disabledforeground="#ffffff",
-            font=theme.font(18, "bold"),
+            activeforeground=colors["primary_ink"],
+            disabledforeground=colors["faint"],
+            font=theme.font(12, "bold"),
             relief="flat",
             bd=0,
             highlightthickness=0,
-            padx=theme.px(68),
-            pady=theme.px(16),
+            padx=theme.px(26),
+            pady=theme.px(8),
             cursor="hand2",
         )
-        self.home_record_btn.pack(pady=(theme.px(6), theme.px(8)))
+        self.home_record_btn.pack(pady=(theme.px(10), theme.px(2)))
 
         self.home_timer_var = tk.StringVar(value="")
         self.home_timer_label = tk.Label(
             input_body,
             textvariable=self.home_timer_var,
             bg=colors["card"],
-            fg=colors["primary_dark"],
-            font=theme.mono(16),
+            fg=colors["primary"],
+            font=theme.mono(18, "bold"),
             anchor="center",
         )
         self.home_timer_label.pack_forget()
 
-        self.home_status_var = tk.StringVar(
-            value=f"不用打字：按 {HOTKEY_LABEL} 说一段，再按一次结束"
-        )
+        self.home_status_var = tk.StringVar(value=HOME_IDLE_HINT)
         self.home_status_label = tk.Label(
             input_body,
             textvariable=self.home_status_var,
             bg=colors["card"],
             fg=colors["muted"],
-            font=theme.font(UI_SIZE),
-            anchor="center",
-        )
-        self.home_status_label.pack(fill="x")
-
-        self.home_mode_var = tk.StringVar(value="")
-        self.home_mode_label = tk.Label(
-            input_body,
-            textvariable=self.home_mode_var,
-            bg=colors["card"],
-            fg=colors["muted"],
             font=theme.font(SMALL_SIZE),
             anchor="center",
         )
-        self.home_mode_label.pack(fill="x", pady=(theme.px(2), theme.px(6)))
+        self.home_status_label.pack(fill="x", pady=(theme.px(1), theme.px(4)))
 
         self.wave_canvas = tk.Canvas(
             input_body,
-            height=theme.px(150),
+            height=theme.px(84),
             bg=colors["wave_bg"],
-            highlightthickness=1,
-            highlightbackground=colors["border"],
+            highlightthickness=0,
             bd=0,
         )
         self.wave_canvas.pack(fill="x")
         self.wave_canvas.bind("<Configure>", self._on_wave_configure)
 
-        # ---------- 结果文本 ----------
-        result_card, result_body = theme_module.make_card(page, theme, "转换结果")
-        result_card.grid(row=1, column=0, sticky="nsew", pady=(theme.px(12), 0))
-        result_body.columnconfigure(0, weight=1)
-        result_body.rowconfigure(0, weight=1)
+        # ---------- 结果区（放大文本区） ----------
+        result_card = tk.Frame(
+            page,
+            bg=colors["card"],
+            highlightbackground=colors["border"],
+            highlightthickness=1,
+            bd=0,
+        )
+        result_card.grid(row=1, column=0, sticky="nsew", pady=(theme.px(10), 0))
+        result_card.columnconfigure(0, weight=1)
+        result_card.rowconfigure(2, weight=1)
 
-        text_wrap = tk.Frame(result_body, bg=colors["card"])
-        text_wrap.grid(row=0, column=0, sticky="nsew")
+        header_row = tk.Frame(result_card, bg=colors["card"])
+        header_row.grid(
+            row=0, column=0, sticky="ew", padx=theme.px(14), pady=(theme.px(8), 0)
+        )
+        tk.Label(
+            header_row,
+            text="转换结果",
+            bg=colors["card"],
+            fg=colors["text"],
+            font=theme.font(UI_SIZE, "bold"),
+        ).pack(side="left")
+        self.home_clear_btn = self._panel_button(
+            header_row, "清空", self._clear_home_text
+        )
+        self.home_clear_btn.pack(side="right")
+        self.home_copy_btn = self._panel_button(
+            header_row, "复制文字", lambda: self._copy_home_text(), accent=True
+        )
+        self.home_copy_btn.pack(side="right", padx=(0, theme.px(6)))
+        self.home_result_info_var = tk.StringVar(value="")
+        self.home_result_info_label = tk.Label(
+            header_row,
+            textvariable=self.home_result_info_var,
+            bg=colors["card"],
+            fg=colors["muted"],
+            font=theme.font(SMALL_SIZE),
+            anchor="e",
+        )
+        self.home_result_info_label.pack(side="right", padx=(0, theme.px(12)))
+
+        self.home_inline_hint = tk.Label(
+            result_card,
+            text="",
+            bg=colors["card"],
+            fg=colors["warning"],
+            font=theme.font(SMALL_SIZE),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(820),
+        )
+        self.home_inline_hint.grid(
+            row=1, column=0, sticky="ew", padx=theme.px(14), pady=(theme.px(4), 0)
+        )
+        self.home_inline_hint.grid_remove()
+
+        text_wrap = tk.Frame(result_card, bg=colors["card"])
+        text_wrap.grid(
+            row=2,
+            column=0,
+            sticky="nsew",
+            padx=theme.px(14),
+            pady=(theme.px(6), theme.px(12)),
+        )
         text_wrap.columnconfigure(0, weight=1)
         text_wrap.rowconfigure(0, weight=1)
         self.home_text = tk.Text(
             text_wrap,
             wrap="word",
             font=theme.font(BODY_SIZE),
-            bg="#fdfefe",
+            bg=colors["input_bg"],
             fg=colors["text"],
             relief="flat",
             bd=0,
             highlightthickness=1,
             highlightbackground=colors["border"],
             highlightcolor=colors["primary"],
-            padx=theme.px(12),
-            pady=theme.px(10),
-            spacing1=theme.px(2),
-            spacing3=theme.px(4),
-            selectbackground=colors["primary_light"],
+            padx=theme.px(14),
+            pady=theme.px(12),
+            spacing1=theme.px(3),
+            spacing3=theme.px(6),
+            selectbackground=colors["selection"],
             selectforeground=colors["text"],
-            insertbackground=colors["text"],
+            insertbackground=colors["primary"],
         )
         text_scroll = ttk.Scrollbar(
             text_wrap, orient="vertical", command=self.home_text.yview
@@ -757,44 +800,30 @@ class MainWindow:
         self.home_text.bind("<FocusOut>", self._on_home_text_focus_out)
         self.home_text.bind("<Control-Return>", self._on_home_copy_shortcut)
 
-        self.home_inline_hint = tk.Label(
-            result_body,
-            text="",
-            bg=colors["card"],
-            fg=colors["warning"],
-            font=theme.font(SMALL_SIZE),
-            anchor="w",
-            justify="left",
-            wraplength=theme.px(760),
-        )
-        self.home_inline_hint.grid(row=1, column=0, sticky="w", pady=(theme.px(6), 0))
-        self.home_inline_hint.grid_remove()
-
-        result_actions = tk.Frame(result_body, bg=colors["card"])
-        result_actions.grid(row=2, column=0, sticky="ew", pady=(theme.px(8), 0))
-
-        self.auto_copy_var = tk.BooleanVar(
-            value=bool(getattr(self.settings, "auto_copy", True))
-        )
-        self.auto_copy_check = self._card_checkbutton(
-            result_actions,
-            "完成后自动复制到剪贴板",
-            self.auto_copy_var,
-            self._on_auto_copy_changed,
-        )
-        self.auto_copy_check.pack(side="left")
-
-        self.home_clear_btn = self._panel_button(
-            result_actions, "清空", self._clear_home_text
-        )
-        self.home_clear_btn.pack(side="right")
-        self.home_copy_btn = self._panel_button(
-            result_actions, "复制文字", lambda: self._copy_home_text(), accent=True
-        )
-        self.home_copy_btn.pack(side="right", padx=(0, theme.px(8)))
-
         self._show_home_placeholder()
+        self._sync_home_text_buttons()
         return page
+
+    def _sync_home_text_buttons(self) -> None:
+        """没有文字时禁用复制/清空按钮，保持界面干净。"""
+        enabled = bool(self._get_home_text())
+        state = "normal" if enabled else "disabled"
+        for button in (
+            getattr(self, "home_copy_btn", None),
+            getattr(self, "home_clear_btn", None),
+        ):
+            if button is None:
+                continue
+            try:
+                button.configure(state=state)
+            except tk.TclError:  # pragma: no cover
+                pass
+
+    def _set_home_meta(self, text: str) -> None:
+        try:
+            self.home_result_info_var.set(text or "")
+        except (tk.TclError, AttributeError):  # pragma: no cover
+            pass
 
     # ------------------------------------------------------------------
     # 首页：文本区
@@ -821,6 +850,7 @@ class MainWindow:
         else:
             self.home_text.insert("1.0", HOME_PLACEHOLDER, "placeholder")
             self._home_placeholder = True
+        self._sync_home_text_buttons()
 
     def _get_home_text(self) -> str:
         if self._home_placeholder:
@@ -829,8 +859,10 @@ class MainWindow:
 
     def _clear_home_text(self) -> None:
         self._show_home_placeholder()
-        self._set_home_status("已清空文字，可以重新说一段。")
+        self._set_home_meta("")
+        self._set_home_status(HOME_IDLE_HINT)
         self._set_status("语音输入：已清空转换结果")
+        self._sync_home_text_buttons()
 
     def _copy_home_text(self, *, silent: bool = False) -> bool:
         text = self._get_home_text()
@@ -861,12 +893,6 @@ class MainWindow:
         self._copy_home_text()
         return "break"
 
-    def _on_auto_copy_changed(self) -> None:
-        if self._closing:
-            return
-        self.settings.auto_copy = bool(self.auto_copy_var.get())
-        self._schedule_save()
-
     # ------------------------------------------------------------------
     # 首页：状态显示
     # ------------------------------------------------------------------
@@ -885,30 +911,6 @@ class MainWindow:
             else:
                 self.home_timer_var.set("")
                 self.home_timer_label.pack_forget()
-        except tk.TclError:  # pragma: no cover
-            pass
-
-    def _set_home_mode_hint(self) -> None:
-        mic_note = ""
-        mic_name = (self.settings.input_device or "").strip()
-        if mic_name:
-            short_name = mic_name.split(" (")[0].strip()
-            mic_note = f" · 麦克风 {short_name[:16]}"
-        if self._processing:
-            text = "文件转写任务进行中，语音输入暂不可用"
-            color = COLORS["warning"]
-        elif self._recorder is None:
-            text = "未检测到麦克风 · 录音不可用（可使用「文件转写」）"
-            color = COLORS["warning"]
-        elif self.settings.has_api_key:
-            text = f"AI 整理已就绪 · {QUICK_STYLE_LABEL}{mic_note}"
-            color = COLORS["muted"]
-        else:
-            text = f"未配置 DeepSeek Key · 仅本地转写（可在「设置」中启用 AI 整理）{mic_note}"
-            color = COLORS["warning"]
-        try:
-            self.home_mode_var.set(text)
-            self.home_mode_label.configure(fg=color)
         except tk.TclError:  # pragma: no cover
             pass
 
@@ -939,7 +941,7 @@ class MainWindow:
         if width <= 10:
             width = self.theme.px(860)
         if height <= 10:
-            height = self.theme.px(150)
+            height = self.theme.px(84)
         return int(width), int(height)
 
     def _on_wave_configure(self, _event: Any = None) -> None:
@@ -948,54 +950,42 @@ class MainWindow:
         elif self._quick_state == "converting":
             self._draw_home_converting()
         else:
-            self._draw_home_idle(self._wave_idle_hint or None)
+            self._draw_home_idle()
 
     def _draw_home_idle(self, message: Optional[str] = None) -> None:
+        """空闲：只画底部基线/细刻度，不放任何文字（保持界面安静）。"""
         try:
             self.wave_canvas.delete("all")
             width, height = self._wave_canvas_size()
-            middle = height / 2
+            theme = self.theme
+            baseline = height - theme.px(6)
             self.wave_canvas.create_line(
-                0, middle, width, middle, fill=COLORS["border"], width=1
+                0, baseline, width, baseline, fill=COLORS["border"], width=1
             )
-            text = message or "说一句，立刻成文"
-            self.wave_canvas.create_text(
-                width / 2,
-                middle - self.theme.px(24),
-                text=text,
-                fill=COLORS["muted"],
-                font=self.theme.font(UI_SIZE + 2),
-            )
-            if message is None:
-                self.wave_canvas.create_text(
-                    width / 2,
-                    middle + self.theme.px(24),
-                    text=f"识别模型 {self.settings.asr_model}"
-                    f" · 整理风格 {QUICK_STYLE_LABEL} · 本地转写",
-                    fill=COLORS["faint"],
-                    font=self.theme.font(SMALL_SIZE),
+            step = theme.px(46)
+            x = step
+            while x < width:
+                self.wave_canvas.create_line(
+                    x, baseline - theme.px(3), x, baseline,
+                    fill=COLORS["grid"], width=1,
                 )
+                x += step
         except tk.TclError:  # pragma: no cover - 窗口销毁中
             pass
 
     def _draw_home_recording(self, levels: List[float]) -> None:
+        """录音：非对称波形，基线在底部，只向上生长。"""
         try:
             self.wave_canvas.delete("all")
             width, height = self._wave_canvas_size()
-            middle = height / 2
             theme = self.theme
+            baseline = height - theme.px(6)
+            max_height = max(theme.px(8), height - theme.px(12))
             self.wave_canvas.create_line(
-                0, middle, width, middle, fill=COLORS["border"], width=1
+                0, baseline, width, baseline, fill=COLORS["border"], width=1
             )
             values = list(levels or [])[-WAVE_BARS:]
             if not values:
-                self.wave_canvas.create_text(
-                    width / 2,
-                    middle,
-                    text="正在聆听…",
-                    fill=COLORS["muted"],
-                    font=theme.font(UI_SIZE + 1),
-                )
                 return
             slot = width / float(WAVE_BARS)
             bar_width = max(theme.px(2), int(slot * 0.55))
@@ -1004,19 +994,19 @@ class MainWindow:
             for index, value in enumerate(values):
                 x = (offset + index + 0.5) * slot
                 level = max(0.0, min(1.0, value))
-                if level < 0.01:  # 噪声门：安静时画最小柱，避免波形像一条直线
+                if level < 0.01:  # 噪声门：安静时只留最小柱
                     amplitude = min_height
                 else:
                     # 视觉放大：安静环境 0.008 接近平线，正常说话 0.2~0.8 起伏明显
                     visual = min(1.0, level * 1.6) ** 0.8
-                    amplitude = max(min_height, visual * (height * 0.42))
+                    amplitude = max(min_height, visual * max_height)
                 ratio = (index + 1) / float(len(values))
                 color = _blend_color(COLORS["wave_old"], COLORS["wave_new"], ratio)
                 self.wave_canvas.create_line(
                     x,
-                    middle - amplitude,
+                    baseline - amplitude,
                     x,
-                    middle + amplitude,
+                    baseline,
                     fill=color,
                     width=bar_width,
                     capstyle="round",
@@ -1025,13 +1015,15 @@ class MainWindow:
             pass
 
     def _draw_home_converting(self) -> None:
+        """转换中：定格已录音波形（暗青），叠加一条扫过的青色扫描线。"""
         try:
             self.wave_canvas.delete("all")
             width, height = self._wave_canvas_size()
-            middle = height / 2
             theme = self.theme
+            baseline = height - theme.px(6)
+            max_height = max(theme.px(8), height - theme.px(12))
             self.wave_canvas.create_line(
-                0, middle, width, middle, fill=COLORS["border"], width=1
+                0, baseline, width, baseline, fill=COLORS["border"], width=1
             )
             values = list(self._last_levels or [])[-WAVE_BARS:]
             if values:
@@ -1042,54 +1034,27 @@ class MainWindow:
                     x = (offset + index + 0.5) * slot
                     level = max(0.0, min(1.0, value))
                     amplitude = max(
-                        theme.px(1), (min(1.0, level * 1.6) ** 0.8) * (height * 0.30)
+                        theme.px(1), (min(1.0, level * 1.6) ** 0.8) * max_height
                     )
                     self.wave_canvas.create_line(
                         x,
-                        middle - amplitude,
+                        baseline - amplitude,
                         x,
-                        middle + amplitude,
+                        baseline,
                         fill=COLORS["wave_frozen"],
                         width=bar_width,
                         capstyle="round",
                     )
-
-            label = f"{self._quick_stage_label or '正在转写…'}"
-            if self._quick_percent > 0:
-                label += f"  {int(round(self._quick_percent))}%"
-            box_width = min(width - theme.px(32), theme.px(330))
-            box_height = theme.px(74)
-            x0 = (width - box_width) / 2
-            y0 = middle - box_height / 2
-            self.wave_canvas.create_rectangle(
-                x0,
-                y0,
-                x0 + box_width,
-                y0 + box_height,
-                fill=COLORS["card"],
-                outline=COLORS["border"],
-            )
-            phase = self._wave_phase * 0.35
-            for index in range(3):
-                radius = theme.px(3) + theme.px(3) * max(
-                    0.0, math.sin(phase + index * 0.9)
-                )
-                center_x = width / 2 + (index - 1) * theme.px(18)
-                center_y = y0 + theme.px(20)
-                self.wave_canvas.create_oval(
-                    center_x - radius,
-                    center_y - radius,
-                    center_x + radius,
-                    center_y + radius,
-                    fill=COLORS["primary"],
-                    outline="",
-                )
-            self.wave_canvas.create_text(
-                width / 2,
-                y0 + theme.px(50),
-                text=label,
-                fill=COLORS["primary_dark"],
-                font=theme.font(UI_SIZE + 1, "bold"),
+            # 扫描线：轻微脉冲，无文字
+            phase = (self._wave_phase * 0.02) % 1.0
+            scan_x = phase * width
+            self.wave_canvas.create_line(
+                scan_x,
+                baseline - max_height,
+                scan_x,
+                baseline,
+                fill=COLORS["primary"],
+                width=theme.px(1),
             )
         except tk.TclError:  # pragma: no cover - 窗口销毁中
             pass
@@ -1198,9 +1163,9 @@ class MainWindow:
         self._last_levels = []
         self._level_history = []
         self._wave_phase = 0
-        self._wave_idle_hint = ""
         self._record_peak = 0.0
         self._silence_warned = False
+        self._set_home_meta("")
         self._set_home_timer("00:00")
         self._set_home_status(self._listening_status())
         self._hide_home_inline_hint()
@@ -1270,6 +1235,7 @@ class MainWindow:
         self._quick_percent = 0.0
         self._quick_interim_text = ""
         self._wave_phase = 0
+        self._set_home_meta("")
         self._set_home_timer("00:00")
         self._set_home_status(f"正在转写…{' 随后 DeepSeek 整理' if refine else ''}")
         if not refine:
@@ -1318,11 +1284,10 @@ class MainWindow:
         self._set_home_timer(None)
         self._set_home_status(status)
         self._set_status("语音输入：" + status)
-        self._wave_idle_hint = wave_hint
+        self._set_home_meta("")
         self.progress_var.set(0.0)
-        self._draw_home_idle(wave_hint or None)
+        self._draw_home_idle()
         self._refresh_action_states()
-        self._set_home_mode_hint()
 
     def _cancel_quick_recording(self) -> None:
         if self._quick_state != "recording":
@@ -1386,7 +1351,7 @@ class MainWindow:
             self._set_status("语音输入：已转写，正在本地整理…")
         self._quick_stage_label = stage_label
         self._set_home_status(stage_label)
-        self._hide_home_inline_hint()
+        self._set_home_meta("已转写 · 正在润色…" if self._quick_has_key else "已转写 · 本地整理…")
         self._draw_home_converting()
 
     def _on_quick_done(self, result: JobResult) -> None:
@@ -1399,30 +1364,25 @@ class MainWindow:
         self._set_home_text(text)
         elapsed = result.elapsed or self._quick_elapsed()
         chars = len(text)
-        if refined:
-            status_text = f"AI 已整理 · 用时 {elapsed:.1f} 秒 · {chars} 字"
-        else:
-            status_text = f"仅本地转写 · 用时 {elapsed:.1f} 秒 · {chars} 字"
         copied = False
         if self.settings.auto_copy and text:
             copied = self._copy_home_text(silent=True)
-            if copied:
-                status_text += " · 已复制到剪贴板"
         self._set_home_timer(None)
-        self._set_home_status(status_text)
-        self._set_status("语音输入：" + status_text)
-        self._wave_idle_hint = (
-            "AI 已整理，可在下方复制或修改"
-            if refined
-            else "已转写，可在下方复制或修改"
+        # 结果元信息只保留在结果区右上角一处；录音区恢复「按 Alt+~」提示，底部状态栏保持干净
+        self._set_home_status(HOME_IDLE_HINT)
+        self._set_status("就绪")
+        meta = (
+            f"{'AI 已整理' if refined else '仅本地转写'} · 用时 "
+            f"{elapsed:.1f} 秒 · {chars} 字"
         )
+        if copied:
+            meta += " · 已复制"
+        self._set_home_meta(meta)
         self.progress_var.set(0.0)
-        self._draw_home_idle(self._wave_idle_hint)
+        self._draw_home_idle()
         if refined:
-            self._show_home_inline_hint(
-                f"已由 DeepSeek「{QUICK_STYLE_LABEL}」整理，可直接修改或复制。",
-                warning=False,
-            )
+            # 元信息已能说明结果状态，不再额外堆小字
+            self._hide_home_inline_hint()
         elif not self.settings.has_api_key:
             self._show_home_inline_hint(
                 "未配置 DeepSeek Key：本次只做本地转写。可在「设置」中填写 Key 启用 AI 整理。"
@@ -1431,8 +1391,8 @@ class MainWindow:
             self._show_home_inline_hint(
                 "本次仅本地转写：AI 整理未生效。可检查「设置 → DeepSeek」后重新录音。"
             )
+        self._sync_home_text_buttons()
         self._refresh_action_states()
-        self._set_home_mode_hint()
 
     def _on_quick_cancelled(self) -> None:
         kept = bool(self._get_home_text())
@@ -1579,7 +1539,7 @@ class MainWindow:
                         text=START_BUTTON_TEXT,
                         bg=COLORS["primary"],
                         activebackground=COLORS["primary_dark"],
-                        fg="#ffffff",
+                        fg=COLORS["primary_ink"],
                         state="normal",
                         cursor="hand2",
                     )
@@ -1608,9 +1568,9 @@ class MainWindow:
                 state="normal" if (quick_idle and not self._processing) else "disabled"
             )
             self._set_options_enabled(quick_idle and not self._processing)
+            self._sync_home_text_buttons()
         except (tk.TclError, AttributeError):  # pragma: no cover - 构建期调用
             return
-        self._set_home_mode_hint()
         self._refresh_tray()
 
     # ==================================================================
@@ -1912,7 +1872,7 @@ class MainWindow:
             parent,
             wrap="word",
             font=theme.font(BODY_SIZE),
-            bg="#fdfefe",
+            bg=colors["input_bg"],
             fg=colors["text"],
             relief="flat",
             bd=0,
@@ -1921,8 +1881,9 @@ class MainWindow:
             pady=theme.px(10),
             spacing1=theme.px(2),
             spacing3=theme.px(4),
-            selectbackground=colors["primary_light"],
+            selectbackground=colors["selection"],
             selectforeground=colors["text"],
+            insertbackground=colors["primary"],
             cursor="arrow",
         )
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=text.yview)
@@ -1963,25 +1924,18 @@ class MainWindow:
             style="Accent.Horizontal.TProgressbar",
             length=theme.px(200),
         )
-        self.progress_bar.pack(side="left", pady=theme.px(4))
+        self.progress_bar.pack(side="left", pady=theme.px(3))
         self.status_var = tk.StringVar(value="就绪")
         tk.Label(
             bottom,
             textvariable=self.status_var,
             bg=colors["bg"],
-            fg=colors["text"],
+            fg=colors["muted"],
             font=theme.font(SMALL_SIZE),
             anchor="w",
         ).pack(side="left", fill="x", expand=True, padx=(theme.px(12), theme.px(8)))
+        # 内存占用仍保留在 memory_var 中（供诊断/集成测试），但不在主界面显示，避免视觉噪音
         self.memory_var = tk.StringVar(value="内存 --")
-        tk.Label(
-            bottom,
-            textvariable=self.memory_var,
-            bg=colors["bg"],
-            fg=colors["faint"],
-            font=theme.font(SMALL_SIZE),
-            anchor="e",
-        ).pack(side="right")
 
     def _set_status(self, message: str) -> None:
         try:
@@ -2032,11 +1986,10 @@ class MainWindow:
             except Exception:  # pragma: no cover - 目录创建失败
                 default_out = ""
             self.output_dir_var.set(self.settings.output_dir.strip() or default_out)
-            self.auto_copy_var.set(bool(getattr(self.settings, "auto_copy", True)))
         finally:
             self._syncing_options = False
         self._refresh_action_states()
-        self._set_home_mode_hint()
+        self._sync_home_text_buttons()
 
     def _on_output_dir_changed(self, *_args: Any) -> None:
         if self._syncing_options:
@@ -2797,13 +2750,6 @@ class MainWindow:
             return
         if self._recorder_note:
             self._set_status(self._recorder_note)
-            return
-        if self.settings.asr_model != "small":
-            size = self._model_size_hint(self.settings.asr_model)
-            hint = f"识别模型：{self.settings.asr_model}"
-            if size:
-                hint += f"（{size}）"
-            self._set_status(hint + " · 首次使用会自动下载")
 
     # ==================================================================
     # 资源监控

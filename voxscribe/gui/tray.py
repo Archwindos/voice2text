@@ -68,20 +68,24 @@ def _load_backend() -> SimpleNamespace:
 
 
 def create_tray_image(recording: bool = False):
-    """用 Pillow 画一个 64x64 麦克风图标（录音时红色，待机时蓝色）。"""
+    """用 Pillow 画 64x64 麦克风图标（浅色主题：待机蓝色、录音红色）。"""
     from PIL import Image, ImageDraw
 
     size = 64
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    background = (220, 38, 38, 255) if recording else (37, 99, 235, 255)
-    white = (255, 255, 255, 255)
+    if recording:
+        background = (220, 38, 38, 255)   # 录音红
+        glyph = (255, 255, 255, 255)
+    else:
+        background = (37, 99, 235, 255)   # 主色蓝
+        glyph = (255, 255, 255, 255)
     draw.ellipse((2, 2, size - 3, size - 3), fill=background)
     # 麦克风胶囊 + 支架
-    draw.rounded_rectangle((26, 13, 38, 34), radius=6, fill=white)
-    draw.arc((20, 23, 44, 46), start=0, end=180, fill=white, width=3)
-    draw.line((32, 46, 32, 51), fill=white, width=3)
-    draw.line((24, 52, 40, 52), fill=white, width=3)
+    draw.rounded_rectangle((26, 13, 38, 34), radius=6, fill=glyph)
+    draw.arc((20, 23, 44, 46), start=0, end=180, fill=glyph, width=3)
+    draw.line((32, 46, 32, 51), fill=glyph, width=3)
+    draw.line((24, 52, 40, 52), fill=glyph, width=3)
     return image
 
 

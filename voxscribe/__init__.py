@@ -6,10 +6,10 @@
         -> DeepSeek API（deepseek-chat，非思考模式）口语整理与润色
         -> 直接复制 / 导出 txt、md、docx、srt
 
-设计目标：快、轻量、隐私友好；托盘常驻，Alt+~ 一键口述。
+设计目标：快、轻量、界面克制、隐私友好；托盘常驻，Alt+~ 一键口述。
 """
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 APP_NAME = "VoxScribe"
 APP_DISPLAY_NAME = "语声成文"
 

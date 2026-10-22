@@ -64,8 +64,8 @@ def _dialog_button(
 ) -> tk.Button:
     """与主界面风格一致的扁平按钮。"""
     if primary:
-        bg, fg = COLORS["primary"], "#ffffff"
-        active_bg, active_fg = COLORS["primary_dark"], "#ffffff"
+        bg, fg = COLORS["primary"], COLORS["primary_ink"]
+        active_bg, active_fg = COLORS["primary_dark"], COLORS["primary_ink"]
         border = COLORS["primary"]
     else:
         bg, fg = COLORS["card"], COLORS["text"]
@@ -265,15 +265,6 @@ class SettingsDialog(tk.Toplevel):
             "线程数 0 = 自动（最多 4 线程，尽量不抢满 CPU）；"
             "空闲卸载 0 = 常驻不卸载（默认，保证口述速度），>0 表示空闲该分钟数后释放模型内存。"
         )
-        self.close_to_tray_var = tk.BooleanVar(
-            value=bool(getattr(self.settings, "close_to_tray", True))
-        )
-        ttk.Checkbutton(
-            perf_body,
-            text="关闭/最小化窗口时隐藏到系统托盘，后台待机",
-            variable=self.close_to_tray_var,
-            style="Card.TCheckbutton",
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(theme.px(8), 0))
 
         # 麦克风设备选择（默认 = 系统默认输入设备）
         self.mic_var = tk.StringVar()
@@ -294,7 +285,7 @@ class SettingsDialog(tk.Toplevel):
         except Exception:  # pragma: no cover - 无录音环境
             log.debug("枚举麦克风设备失败", exc_info=True)
         _card_label(perf_body, theme, "麦克风设备").grid(
-            row=2, column=0, sticky="w", padx=(0, theme.px(10)), pady=(theme.px(8), 0)
+            row=1, column=0, sticky="w", padx=(0, theme.px(10)), pady=(theme.px(8), 0)
         )
         self.mic_combo = ttk.Combobox(
             perf_body,
@@ -304,8 +295,28 @@ class SettingsDialog(tk.Toplevel):
             width=36,
         )
         self.mic_combo.grid(
-            row=2, column=1, columnspan=3, sticky="w", pady=(theme.px(8), 0)
+            row=1, column=1, columnspan=3, sticky="w", pady=(theme.px(8), 0)
         )
+
+        # 语音输入行为（收纳进「识别与性能」卡片，减少界面区块）
+        self.auto_copy_var = tk.BooleanVar(
+            value=bool(getattr(self.settings, "auto_copy", True))
+        )
+        ttk.Checkbutton(
+            perf_body,
+            text="完成后自动复制到剪贴板",
+            variable=self.auto_copy_var,
+            style="Card.TCheckbutton",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(theme.px(8), 0))
+        self.close_to_tray_var = tk.BooleanVar(
+            value=bool(getattr(self.settings, "close_to_tray", True))
+        )
+        ttk.Checkbutton(
+            perf_body,
+            text="关闭/最小化时隐藏到托盘",
+            variable=self.close_to_tray_var,
+            style="Card.TCheckbutton",
+        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(theme.px(8), 0))
         _card_label(
             perf_body, theme, perf_hint, muted=True, wraplength=theme.px(500)
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(theme.px(6), 0))
@@ -399,6 +410,7 @@ class SettingsDialog(tk.Toplevel):
             else str(default_output_dir())
         )
         self.close_to_tray_var.set(bool(getattr(settings, "close_to_tray", True)))
+        self.auto_copy_var.set(bool(getattr(settings, "auto_copy", True)))
         try:
             self.mic_var.set(settings.input_device.strip() or "默认输入设备")
         except Exception:  # pragma: no cover - 旧配置
@@ -601,6 +613,7 @@ class SettingsDialog(tk.Toplevel):
         self.settings.cpu_threads = threads
         self.settings.idle_unload_minutes = idle_minutes
         self.settings.close_to_tray = bool(self.close_to_tray_var.get())
+        self.settings.auto_copy = bool(self.auto_copy_var.get())
         self.settings.glossary = self.glossary_text.get("1.0", "end-1c").strip()
         mic_choice = self.mic_var.get().strip()
         self.settings.input_device = (
@@ -844,7 +857,7 @@ _HELP_TEXT = f"""语音输入：说一句，立刻成文（推荐）
 · 本地转写免费：语音识别完全在本机 CPU 上完成，音频不会上传到任何服务器。
 · AI 整理可选：在「设置」中填写 DeepSeek API Key 后启用；没有 Key 时语音输入会自动退化为仅本地转写。
 · API Key 安全：使用 Windows DPAPI 加密保存在本机，只有当前 Windows 用户能解密；设置里留空保存不会清掉已保存的 Key。
-· 模型空闲自动卸载：默认空闲 5 分钟后自动释放识别模型占用的内存，可在设置中调整。
+· 空闲卸载模型：默认 0（常驻不卸载，保证口述速度）；如需节省内存可在设置中改为指定分钟数。
 · CPU 占用可控：默认最多使用 4 个线程，避免占满电脑资源。
 · 数据都在本地：配置在 data/config.json，录音在 data/recordings，日志在 data/logs/app.log。
 
