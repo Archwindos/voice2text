@@ -138,6 +138,7 @@ class Recorder:
             raise ValueError(f"采样率必须为正数：{samplerate}")
         self.recordings_dir = Path(recordings_dir)
         self.samplerate = samplerate
+        self._active_samplerate = samplerate
         self._max_frames = int(MAX_RECORD_SECONDS * samplerate)
 
         self._lock = threading.RLock()
@@ -204,6 +205,42 @@ class Recorder:
     # ------------------------------------------------------------------
     # 录音控制
     # ------------------------------------------------------------------
+    def _negotiate_samplerate(
+        self, sounddevice: Any, device: Optional[int], device_name: str
+    ) -> int:
+        """选择设备实际支持的采样率。
+
+        优先 16kHz；若该麦克风不支持（不少 USB/蓝牙麦克风只支持 44.1/48kHz），
+        自动退到设备的默认采样率并使用它写 wav。
+        """
+        candidates: List[int] = [self.samplerate]
+        try:
+            info = sounddevice.query_devices(device, "input")
+            default_rate = int(round(float(info.get("default_samplerate") or 0)))
+            if default_rate > 0 and default_rate not in candidates:
+                candidates.append(default_rate)
+        except Exception:
+            log.debug("查询麦克风默认采样率失败", exc_info=True)
+        for rate in candidates:
+            try:
+                sounddevice.check_input_settings(
+                    device=device,
+                    channels=CHANNELS,
+                    dtype="int16",
+                    samplerate=rate,
+                )
+                if rate != self.samplerate:
+                    log.info("麦克风不支持 %d Hz，改用设备默认 %d Hz", self.samplerate, rate)
+                return rate
+            except Exception:
+                continue
+        raise errors.AudioError(
+            f"无法使用麦克风{('：' + device_name) if device_name else ''}",
+            hint="请确认麦克风已连接、没有被其他程序独占，"
+            "并在系统「设置 → 隐私 → 麦克风」中允许应用访问麦克风；"
+            "如仍失败，可在设置里换一个麦克风设备。",
+        )
+
     def start(self, device: Optional[int] = None) -> None:
         """开始录音；设备不可用 / 被占用时抛 :class:`voxscribe.errors.AudioError`。"""
         with self._lock:
@@ -222,20 +259,8 @@ class Recorder:
             )
 
         device_name = self._describe_device(sounddevice, device)
-        try:
-            # 先校验参数，能在打开流之前给出更明确的中文错误
-            sounddevice.check_input_settings(
-                device=device,
-                channels=CHANNELS,
-                dtype="int16",
-                samplerate=self.samplerate,
-            )
-        except Exception as exc:
-            raise errors.AudioError(
-                f"无法使用麦克风{('：' + device_name) if device_name else ''}",
-                hint="请确认麦克风已连接、没有被其他程序独占，"
-                "并在系统「设置 → 隐私 → 麦克风」中允许应用访问麦克风。",
-            ) from exc
+        samplerate = self._negotiate_samplerate(sounddevice, device, device_name)
+        max_frames = int(MAX_RECORD_SECONDS * samplerate)
 
         pcm_queue: queue.Queue = queue.Queue()
         with self._lock:
@@ -245,6 +270,8 @@ class Recorder:
             self._overflow = False
             self._started_at = time.monotonic()
             self._recording = True
+            self._active_samplerate = samplerate
+            self._max_frames = max_frames
         self._reset_level_history()  # 新录音从空白波形开始（上一轮 stop 保留的历史作废）
 
         def _callback(indata, frame_count: int, time_info, status) -> None:  # noqa: ANN001
@@ -259,8 +286,8 @@ class Recorder:
                 if self._queue is not current_queue:
                     return
                 self._frames += int(frame_count)
-                self._elapsed = self._frames / float(self.samplerate)
-                overflow = self._frames >= self._max_frames
+                self._elapsed = self._frames / float(samplerate)
+                overflow = self._frames >= max_frames
             self._push_level(level)
             current_queue.put_nowait(payload)
             if overflow:
@@ -271,7 +298,7 @@ class Recorder:
         stream = None
         try:
             stream = sounddevice.InputStream(
-                samplerate=self.samplerate,
+                samplerate=samplerate,
                 channels=CHANNELS,
                 dtype="int16",
                 device=device,
@@ -291,12 +318,14 @@ class Recorder:
             raise errors.AudioError(
                 f"无法开始录音{('：' + device_name) if device_name else ''}",
                 hint="麦克风可能被其他程序占用。请关闭占用麦克风的软件后重试，"
-                "或换一个输入设备（设置 → 录音设备）。",
+                "或换一个输入设备（设置 → 麦克风设备）。",
             ) from exc
 
         with self._lock:
             self._stream = stream
-        log.info("开始录音：设备 %s，%d Hz 单声道", device_name or "默认输入设备", self.samplerate)
+        log.info(
+            "开始录音：设备 %s，%d Hz 单声道", device_name or "默认输入设备", samplerate
+        )
 
     def stop(self) -> Path:
         """停止录音并保存为 wav，返回文件路径。"""
@@ -319,6 +348,7 @@ class Recorder:
             self._queue = None
             overflow = self._overflow
             duration = self._elapsed
+            active_samplerate = self._active_samplerate
 
         pcm_data = self._drain_queue(pcm_queue)
         if overflow:
@@ -336,7 +366,7 @@ class Recorder:
         written = write_pcm16_wav(
             target,
             pcm_data,
-            samplerate=self.samplerate,
+            samplerate=active_samplerate,
             channels=CHANNELS,
         )
         log.info(
@@ -381,6 +411,12 @@ class Recorder:
         """已录制时长（秒，按已收集到的采样帧数计算）。"""
         with self._lock:
             return max(0.0, self._elapsed)
+
+    @property
+    def active_samplerate(self) -> int:
+        """本次/最近一次录音实际使用的采样率（不支持 16k 时会退到设备默认值）。"""
+        with self._lock:
+            return int(self._active_samplerate)
 
     @property
     def level(self) -> float:

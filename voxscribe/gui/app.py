@@ -889,6 +889,11 @@ class MainWindow:
             pass
 
     def _set_home_mode_hint(self) -> None:
+        mic_note = ""
+        mic_name = (self.settings.input_device or "").strip()
+        if mic_name:
+            short_name = mic_name.split(" (")[0].strip()
+            mic_note = f" · 麦克风 {short_name[:16]}"
         if self._processing:
             text = "文件转写任务进行中，语音输入暂不可用"
             color = COLORS["warning"]
@@ -896,10 +901,10 @@ class MainWindow:
             text = "未检测到麦克风 · 录音不可用（可使用「文件转写」）"
             color = COLORS["warning"]
         elif self.settings.has_api_key:
-            text = f"AI 整理已就绪 · {QUICK_STYLE_LABEL}"
+            text = f"AI 整理已就绪 · {QUICK_STYLE_LABEL}{mic_note}"
             color = COLORS["muted"]
         else:
-            text = "未配置 DeepSeek Key · 仅本地转写（可在「设置」中启用 AI 整理）"
+            text = f"未配置 DeepSeek Key · 仅本地转写（可在「设置」中启用 AI 整理）{mic_note}"
             color = COLORS["warning"]
         try:
             self.home_mode_var.set(text)
@@ -1117,6 +1122,23 @@ class MainWindow:
         """全局 Alt+~：开始/停止录音（窗口前台、最小化到托盘或隐藏时都生效）。"""
         self._toggle_quick()
 
+    def _resolve_input_device(self) -> Optional[int]:
+        """把设置里保存的麦克风名字解析为 sounddevice 设备索引。
+
+        找不到（设备被拔掉/改名）时回退到系统默认输入设备，并记录日志。
+        """
+        name = (self.settings.input_device or "").strip()
+        if not name or self._recorder is None:
+            return None
+        try:
+            for index, device_name in Recorder.list_input_devices():
+                if device_name == name:
+                    return int(index)
+        except Exception:  # pragma: no cover - 设备枚举失败
+            log.debug("枚举麦克风设备失败", exc_info=True)
+        log.warning("找不到已保存的麦克风 %r，改用系统默认输入设备", name)
+        return None
+
     def _quick_start(self) -> None:
         if self._quick_state != "idle":
             return
@@ -1136,7 +1158,7 @@ class MainWindow:
             )
             return
         try:
-            self._recorder.start()
+            self._recorder.start(device=self._resolve_input_device())
         except NotImplementedError:
             messagebox.showinfo(
                 "录音暂不可用", "录音模块尚未完成，请稍后再试。", parent=self.root
@@ -1165,6 +1187,8 @@ class MainWindow:
         self._level_history = []
         self._wave_phase = 0
         self._wave_idle_hint = ""
+        self._record_peak = 0.0
+        self._silence_warned = False
         self._set_home_timer("00:00")
         self._set_home_status(self._listening_status())
         self._hide_home_inline_hint()
@@ -1452,6 +1476,7 @@ class MainWindow:
             self._draw_home_recording(levels)
             self._set_home_timer(format_timestamp(self._recording_elapsed()))
             self._set_home_status(self._listening_status())
+            self._check_recording_sound(levels)
         elif self._quick_state == "converting":
             self._wave_phase += 1
             self._draw_home_converting()
@@ -1462,6 +1487,22 @@ class MainWindow:
             self._wave_job = self.root.after(self.WAVE_MS, self._wave_tick)
         except tk.TclError:  # pragma: no cover
             self._wave_job = None
+
+    def _check_recording_sound(self, levels: List[float]) -> None:
+        """录音 1.5 秒仍没有明显音量时提示检查麦克风，避免“说了没反应”。"""
+        peak = max(levels) if levels else 0.0
+        self._record_peak = max(getattr(self, "_record_peak", 0.0), peak)
+        if getattr(self, "_silence_warned", False):
+            if peak >= 0.05:  # 又检测到声音：撤掉警告
+                self._silence_warned = False
+                self._hide_home_inline_hint()
+            return
+        if self._recording_elapsed() >= 1.5 and self._record_peak < 0.02:
+            self._silence_warned = True
+            self._show_home_inline_hint(
+                "没有检测到声音：请检查麦克风是否静音、系统是否允许应用使用麦克风，"
+                "或在「设置」中换一个麦克风设备。"
+            )
 
     def _read_levels(self) -> List[float]:
         """读取实时音量：优先 Recorder.recent_levels，退化为 level 自行累积。"""

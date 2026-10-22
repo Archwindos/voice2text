@@ -84,6 +84,7 @@ class AppSettings:
     beam_size: int = 5
     vad_filter: bool = True
     model_dir: str = ""  # 空 = data/models
+    input_device: str = ""  # 麦克风设备名；空 = 系统默认输入设备
     idle_unload_minutes: int = 0  # 0 = 常驻不卸载（保证口述响应速度）
 
     # --- DeepSeek 文本整理（deepseek-chat，非思考模式，低延迟）---

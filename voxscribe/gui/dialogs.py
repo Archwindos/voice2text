@@ -136,7 +136,7 @@ class SettingsDialog(tk.Toplevel):
     def _build(self) -> None:
         theme = self.theme
         outer = tk.Frame(self, bg=COLORS["bg"])
-        outer.pack(fill="both", expand=True, padx=theme.px(20), pady=(theme.px(16), theme.px(14)))
+        outer.pack(fill="both", expand=True, padx=theme.px(20), pady=(theme.px(14), theme.px(10)))
 
         # 底部按钮先占位，保证窗口变矮时也可见
         buttons = tk.Frame(outer, bg=COLORS["bg"])
@@ -150,7 +150,7 @@ class SettingsDialog(tk.Toplevel):
 
         # --- DeepSeek ---
         deepseek_card, deepseek_body = make_card(outer, theme, "DeepSeek 文字整理")
-        deepseek_card.pack(fill="x", pady=(0, theme.px(12)))
+        deepseek_card.pack(fill="x", pady=(0, theme.px(8)))
         deepseek_body.columnconfigure(1, weight=1)
 
         self.api_key_var = tk.StringVar()
@@ -242,7 +242,7 @@ class SettingsDialog(tk.Toplevel):
 
         # --- 识别与性能 ---
         perf_card, perf_body = make_card(outer, theme, "识别与性能")
-        perf_card.pack(fill="x", pady=(0, theme.px(12)))
+        perf_card.pack(fill="x", pady=(0, theme.px(8)))
         for column in (1, 3):
             perf_body.columnconfigure(column, weight=1)
 
@@ -263,7 +263,7 @@ class SettingsDialog(tk.Toplevel):
 
         perf_hint = (
             "线程数 0 = 自动（最多 4 线程，尽量不抢满 CPU）；"
-            "空闲卸载分钟数 0 = 不卸载，默认 5 分钟空闲后释放识别模型内存。"
+            "空闲卸载 0 = 常驻不卸载（默认，保证口述速度），>0 表示空闲该分钟数后释放模型内存。"
         )
         self.close_to_tray_var = tk.BooleanVar(
             value=bool(getattr(self.settings, "close_to_tray", True))
@@ -274,16 +274,48 @@ class SettingsDialog(tk.Toplevel):
             variable=self.close_to_tray_var,
             style="Card.TCheckbutton",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(theme.px(8), 0))
+
+        # 麦克风设备选择（默认 = 系统默认输入设备）
+        self.mic_var = tk.StringVar()
+        mic_values = ["默认输入设备"]
+        try:
+            from ..recorder import Recorder as _Recorder  # noqa: PLC0415
+
+            seen_names = set()
+            for _index, _name in _Recorder.list_input_devices():
+                if not _name or _name in seen_names:
+                    continue
+                if _name.startswith(("Microsoft 声音映射器", "主声音", "Input ()")):
+                    continue
+                if _name.startswith("电脑扬声器"):
+                    continue
+                seen_names.add(_name)
+                mic_values.append(_name)
+        except Exception:  # pragma: no cover - 无录音环境
+            log.debug("枚举麦克风设备失败", exc_info=True)
+        _card_label(perf_body, theme, "麦克风设备").grid(
+            row=2, column=0, sticky="w", padx=(0, theme.px(10)), pady=(theme.px(8), 0)
+        )
+        self.mic_combo = ttk.Combobox(
+            perf_body,
+            textvariable=self.mic_var,
+            values=mic_values,
+            state="readonly",
+            width=36,
+        )
+        self.mic_combo.grid(
+            row=2, column=1, columnspan=3, sticky="w", pady=(theme.px(8), 0)
+        )
         _card_label(
             perf_body, theme, perf_hint, muted=True, wraplength=theme.px(500)
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(theme.px(4), 0))
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(theme.px(6), 0))
 
         # --- 术语表 ---
         glossary_card, glossary_body = make_card(outer, theme, "术语表（可选）")
-        glossary_card.pack(fill="x", pady=(0, theme.px(12)))
+        glossary_card.pack(fill="x", pady=(0, theme.px(8)))
         self.glossary_text = tk.Text(
             glossary_body,
-            height=4,
+            height=3,
             wrap="word",
             font=theme.font(UI_SIZE),
             bg=COLORS["input_bg"],
@@ -367,6 +399,10 @@ class SettingsDialog(tk.Toplevel):
             else str(default_output_dir())
         )
         self.close_to_tray_var.set(bool(getattr(settings, "close_to_tray", True)))
+        try:
+            self.mic_var.set(settings.input_device.strip() or "默认输入设备")
+        except Exception:  # pragma: no cover - 旧配置
+            self.mic_var.set("默认输入设备")
         if settings.glossary:
             self.glossary_text.delete("1.0", "end")
             self.glossary_text.insert("1.0", settings.glossary)
@@ -566,6 +602,10 @@ class SettingsDialog(tk.Toplevel):
         self.settings.idle_unload_minutes = idle_minutes
         self.settings.close_to_tray = bool(self.close_to_tray_var.get())
         self.settings.glossary = self.glossary_text.get("1.0", "end-1c").strip()
+        mic_choice = self.mic_var.get().strip()
+        self.settings.input_device = (
+            "" if mic_choice in ("", "默认输入设备") else mic_choice
+        )
         self.settings.output_dir = str(output_path) if output_path else ""
 
         try:

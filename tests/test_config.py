@@ -20,6 +20,7 @@ def test_defaults() -> None:
     assert settings.idle_unload_seconds() == 0  # 默认常驻，保证口述响应速度
     assert settings.close_to_tray is True
     assert settings.preload_model is True
+    assert settings.input_device == ""
     assert settings.effective_device() == "cuda"
     assert settings.effective_compute_type() == "float16"
 
