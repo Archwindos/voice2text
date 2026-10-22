@@ -10,6 +10,9 @@
     recorder.cancel() -> None                     # 停止并删除未完成的录音
     recorder.is_recording -> bool
     recorder.elapsed_seconds -> float
+    recorder.level -> float                       # v1.1 实时音量 0.0~1.0（未录音时 0.0）
+    recorder.recent_levels(count=90) -> list[float]  # v1.1 最近 count 个音量（旧→新）
+    pcm16_level(frames) -> float                  # v1.1 模块级：PCM16 字节 -> 归一化音量
 
 实现要点：
 * 16kHz / 单声道 / PCM16，用标准库 ``wave`` 直接写文件，无需额外依赖；
@@ -17,19 +20,26 @@
   False，``start()`` 抛出 ``voxscribe.errors.AudioError``（中文提示）；
 * 录音数据在 PortAudio 回调线程中收集进线程安全队列，主线程只读状态；
   停止时一次性拼接并写 wav（最长 2 小时，防止内存无限增长）；
-* ``write_pcm16_wav()`` 抽成模块级函数，方便在没有麦克风的机器上单测。
+* 实时音量：每次音频回调用纯 Python ``array('h')`` 计算 RMS 并软压缩到 0.0~1.0，
+  写入线程安全的 ``collections.deque``（最长 240 个），供 GUI 每 50ms 轮询绘图；
+  不引入 numpy 等新依赖（512 采样/帧的纯 Python 计算开销可忽略）；
+* ``write_pcm16_wav()`` / ``pcm16_level()`` 抽成模块级函数，方便无麦克风机器单测。
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import queue
+import sys
 import threading
 import time
 import wave
+from array import array
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Deque, List, Optional, Tuple
 
 from . import errors
 
@@ -41,8 +51,47 @@ CHANNELS = 1
 SAMPLE_WIDTH = 2  # PCM16，2 字节/采样
 #: 最长录音时长保护（秒）
 MAX_RECORD_SECONDS = 2 * 60 * 60
+#: 实时音量历史最多保留的回调次数（16kHz/512 采样约 16 秒；GUI 只取最近 90 个）
+LEVEL_HISTORY_MAX = 240
+#: 软压缩参考点：RMS 达到 0.25 满幅即视为 1.0（正常说话约 0.02~0.08）
+_LEVEL_FULL_SCALE = 0.25
+#: PCM16 满幅值
+_PCM16_FULL_SCALE = 32768.0
 #: 写出 wav 时要求的最短有效数据（短于一帧视为没有录到声音）
 _MIN_PCM_BYTES = SAMPLE_WIDTH * CHANNELS
+
+
+def pcm16_level(frames: bytes) -> float:
+    """把一段 PCM16（小端）音频换算成归一化音量。
+
+    计算方式：先求 RMS，再软压缩到 ``0.0~1.0``：
+
+    ``level = min(1.0, rms / 0.25) ** 0.5``
+
+    这样正常说话（RMS 约 0.02~0.08）会落在 0.3~0.6，波形起伏明显；
+    静音返回 0.0，满幅正弦接近 1.0。纯 Python ``array('h')`` 实现，
+    512 采样/帧的开销远小于音频回调周期，不需要 numpy。
+
+    :param frames: PCM16 小端字节（sounddevice 默认 int16 / 小端）。
+    :return: ``0.0~1.0`` 的音量；空数据或静音返回 0.0。
+    """
+    if not frames:
+        return 0.0
+    usable = len(frames) - (len(frames) % SAMPLE_WIDTH)
+    if usable <= 0:
+        return 0.0
+    samples: array[int] = array("h")
+    samples.frombytes(frames[:usable])
+    if sys.byteorder == "big":  # Windows/Python 默认小端；保持跨平台正确
+        samples.byteswap()
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    rms = math.sqrt(total / len(samples)) / _PCM16_FULL_SCALE
+    if rms <= 0.0:
+        return 0.0
+    return min(1.0, rms / _LEVEL_FULL_SCALE) ** 0.5
+
 
 
 def write_pcm16_wav(
@@ -99,6 +148,9 @@ class Recorder:
         self._elapsed = 0.0
         self._started_at = 0.0
         self._overflow = False
+        # 实时音量：回调线程写、GUI 线程读，统一由 _lock 保护
+        self._levels: Deque[float] = deque(maxlen=LEVEL_HISTORY_MAX)
+        self._level = 0.0
 
     # ------------------------------------------------------------------
     # 设备查询（不抛异常）
@@ -193,6 +245,7 @@ class Recorder:
             self._overflow = False
             self._started_at = time.monotonic()
             self._recording = True
+        self._reset_level_history()  # 新录音从空白波形开始（上一轮 stop 保留的历史作废）
 
         def _callback(indata, frame_count: int, time_info, status) -> None:  # noqa: ANN001
             current_queue = self._queue
@@ -201,12 +254,14 @@ class Recorder:
             if status:
                 log.debug("录音状态提示：%s", status)
             payload = indata.tobytes()
+            level = pcm16_level(payload)  # 512 采样纯 Python RMS，开销可忽略
             with self._lock:
                 if self._queue is not current_queue:
                     return
                 self._frames += int(frame_count)
                 self._elapsed = self._frames / float(self.samplerate)
                 overflow = self._frames >= self._max_frames
+            self._push_level(level)
             current_queue.put_nowait(payload)
             if overflow:
                 self._overflow = True
@@ -232,6 +287,7 @@ class Recorder:
                 self._stream = None
                 self._frames = 0
                 self._elapsed = 0.0
+            self._reset_level_history()
             raise errors.AudioError(
                 f"无法开始录音{('：' + device_name) if device_name else ''}",
                 hint="麦克风可能被其他程序占用。请关闭占用麦克风的软件后重试，"
@@ -303,6 +359,9 @@ class Recorder:
             self._frames = 0
             self._elapsed = 0.0
             self._started_at = 0.0
+            # 取消即数据作废：实时音量历史一并清空（stop() 才保留用于定格）
+            self._levels.clear()
+            self._level = 0.0
         if stream is not None:
             self._close_stream(stream)
         self._drain_queue(pcm_queue)
@@ -322,6 +381,55 @@ class Recorder:
         """已录制时长（秒，按已收集到的采样帧数计算）。"""
         with self._lock:
             return max(0.0, self._elapsed)
+
+    @property
+    def level(self) -> float:
+        """最近一次音频回调的归一化音量（0.0~1.0）；未录音/停止后为 0.0。
+
+        GUI 可每 50ms 读取一次做麦克风电平指示；正常说话通常在 0.2~0.8 之间变化。
+        """
+        with self._lock:
+            return self._level if self._recording else 0.0
+
+    def recent_levels(self, count: int = 90) -> List[float]:
+        """返回最近 ``count`` 个回调音量（旧→新），用于绘制滚动波形。
+
+        * 录音中每次音频回调追加一个值，最多保留 :data:`LEVEL_HISTORY_MAX` 个；
+        * ``start()`` 开始新录音时清空；``stop()`` 停止后保留最后一批供界面定格；
+        * 未录音且无历史数据时返回 ``[]``；``count <= 0`` 返回 ``[]``；
+          历史不足 ``count`` 个时返回全部已有值；
+        * 线程安全：回调线程写入、GUI 线程读取互不阻塞（持锁时间极短）。
+        """
+        try:
+            wanted = int(count)
+        except (TypeError, ValueError):
+            return []
+        if wanted <= 0:
+            return []
+        with self._lock:
+            if not self._levels:
+                return []
+            values = list(self._levels)
+        return values[-wanted:]
+
+    def _push_level(self, raw_level: float) -> None:
+        """记录一次回调音量（PortAudio 回调线程调用；测试可注入假数据）。"""
+        try:
+            value = float(raw_level)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(value):  # NaN/Inf 等异常值直接忽略
+            return
+        value = max(0.0, min(1.0, value))
+        with self._lock:
+            self._level = value
+            self._levels.append(value)
+
+    def _reset_level_history(self) -> None:
+        """清空实时音量历史与当前值（``start()`` 新录音时调用）。"""
+        with self._lock:
+            self._levels.clear()
+            self._level = 0.0
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -377,8 +485,10 @@ class Recorder:
 __all__ = [
     "Recorder",
     "write_pcm16_wav",
+    "pcm16_level",
     "SAMPLE_RATE",
     "CHANNELS",
     "SAMPLE_WIDTH",
     "MAX_RECORD_SECONDS",
+    "LEVEL_HISTORY_MAX",
 ]

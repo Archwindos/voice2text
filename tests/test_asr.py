@@ -3,6 +3,8 @@
 分两层：
 
 * 单元测试：不下载模型、不依赖麦克风，默认全跑；
+  覆盖 v1.1 的实时音量波形 API（``level`` / ``recent_levels()`` / ``pcm16_level()``），
+  并用假 sounddevice 验证回调→音量历史→wav 的完整链路；
 * 端到端测试：用 Windows 中文 TTS 生成的 ``tests/fixtures/tts_zh.wav``，
   以真实 faster-whisper ``tiny`` 模型转写（模型缓存在项目 ``data/models``）。
   默认跳过，需要显式开启：
@@ -21,12 +23,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess
 import threading
 import time
 import wave
+from array import array
 from pathlib import Path
 from typing import List, Tuple
 
@@ -37,10 +41,12 @@ from voxscribe.asr import MODEL_SIZE_HINTS, ZH_INITIAL_PROMPT, WhisperASR
 from voxscribe.config import ASR_MODELS
 from voxscribe.recorder import (
     CHANNELS,
+    LEVEL_HISTORY_MAX,
     MAX_RECORD_SECONDS,
     SAMPLE_RATE,
     SAMPLE_WIDTH,
     Recorder,
+    pcm16_level,
     write_pcm16_wav,
 )
 from voxscribe.util import process_memory_mb
@@ -194,6 +200,78 @@ def _memory_mb() -> float:
     except Exception:  # pragma: no cover - 兜底实现失败时不阻塞测试
         pass
     return 0.0
+
+
+def _pcm16_sine(
+    frames: int = 512,
+    *,
+    amplitude: int = 32767,
+    frequency: float = 440.0,
+    samplerate: int = SAMPLE_RATE,
+) -> bytes:
+    """生成一段正弦波 PCM16 小端字节（用于音量计算测试）。"""
+    samples = array(
+        "h",
+        [
+            int(amplitude * math.sin(2 * math.pi * frequency * index / samplerate))
+            for index in range(frames)
+        ],
+    )
+    return samples.tobytes()
+
+
+class _FakeInputStream:
+    """假 sounddevice.InputStream：start() 时同步喂一帧正弦波数据。
+
+    用它在没有麦克风/不打扰用户的情况下验证
+    「回调 → level/recent_levels → 队列 → wav」完整链路。
+    """
+
+    instances: List["_FakeInputStream"] = []
+
+    def __init__(self, **kwargs) -> None:  # noqa: ANN003
+        self.callback = kwargs["callback"]
+        self.started = False
+        self.closed = False
+        _FakeInputStream.instances.append(self)
+
+    def start(self) -> None:
+        self.started = True
+        samples = array(
+            "h",
+            [
+                int(12000 * math.sin(2 * math.pi * 440 * index / SAMPLE_RATE))
+                for index in range(512)
+            ],
+        )
+        self.callback(samples, 512, None, None)
+
+    def stop(self) -> None:
+        self.started = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSoundDevice:
+    """假 sounddevice 模块（只实现 Recorder 用到的接口）。"""
+
+    CallbackStop = RuntimeError
+
+    def __init__(self) -> None:
+        _FakeInputStream.instances = []
+
+    @staticmethod
+    def check_input_settings(**kwargs) -> None:  # noqa: ANN003
+        return None
+
+    @staticmethod
+    def query_devices(device=None):  # noqa: ANN001
+        return {"name": "Fake Mic", "max_input_channels": 1}
+
+    @staticmethod
+    def InputStream(**kwargs) -> _FakeInputStream:  # noqa: ANN003
+        return _FakeInputStream(**kwargs)
 
 
 # ===========================================================================
@@ -555,6 +633,174 @@ def test_cancel_discards_recording(tmp_path: Path) -> None:
 
 def test_recorder_limits() -> None:
     assert MAX_RECORD_SECONDS == 2 * 60 * 60
+
+
+# ===========================================================================
+# v1.1 实时音量波形：pcm16_level / level / recent_levels
+# ===========================================================================
+def test_pcm16_level_empty_and_silence() -> None:
+    assert pcm16_level(b"") == 0.0
+    assert pcm16_level(b"\x00" * 1024) == 0.0
+    assert pcm16_level(b"\x00") == 0.0  # 不足一个采样：忽略
+    assert pcm16_level(b"\x00\x00\x00") == 0.0  # 尾部不完整字节：忽略
+
+
+def test_pcm16_level_full_scale_sine_is_loud() -> None:
+    level = pcm16_level(_pcm16_sine(512))
+    assert level > 0.5  # 满幅正弦 RMS≈0.707，软压缩后接近 1.0
+    assert level <= 1.0
+    assert level == pytest.approx(1.0, abs=0.02)
+
+
+def test_pcm16_level_tracks_amplitude() -> None:
+    quiet = pcm16_level(_pcm16_sine(512, amplitude=327))  # 约 1% 幅度
+    medium = pcm16_level(_pcm16_sine(512, amplitude=4000))
+    loud = pcm16_level(_pcm16_sine(512))
+    assert 0.0 < quiet < medium < loud <= 1.0
+    assert quiet < 0.2
+
+
+def test_pcm16_level_random_range() -> None:
+    # 任意 PCM16 数据都应落在 [0, 1]
+    pcm = array("h", [((index * 7919) % 65536) - 32768 for index in range(256)]).tobytes()
+    level = pcm16_level(pcm)
+    assert 0.0 <= level <= 1.0
+
+
+def test_level_and_recent_levels_initial_state(tmp_path: Path) -> None:
+    recorder = Recorder(tmp_path / "recordings")
+    assert recorder.level == 0.0
+    assert recorder.recent_levels() == []
+    assert recorder.recent_levels(0) == []
+    assert recorder.recent_levels(-5) == []
+
+
+def test_recent_levels_order_and_count(tmp_path: Path) -> None:
+    recorder = Recorder(tmp_path / "recordings")
+    values = [0.0, 0.1, 0.25, 0.5, 1.0]
+    for value in values:
+        recorder._push_level(value)  # noqa: SLF001 模拟回调线程写入
+    # 旧→新，且 count 只截取最近 N 个
+    assert recorder.recent_levels() == values
+    assert recorder.recent_levels(3) == [0.25, 0.5, 1.0]
+    assert recorder.recent_levels(100) == values
+    # 未录音时 level 归零，但历史保留（stop 后 GUI 定格语义）
+    assert recorder.level == 0.0
+
+
+def test_recent_levels_clamps_and_ignores_bad_values(tmp_path: Path) -> None:
+    recorder = Recorder(tmp_path / "recordings")
+    recorder._push_level(2.0)  # noqa: SLF001 越界值截断到 1.0
+    recorder._push_level(-1.0)  # noqa: SLF001 负值截断到 0.0
+    recorder._push_level(float("nan"))  # noqa: SLF001 非有限值直接忽略
+    recorder._push_level(float("inf"))  # noqa: SLF001
+    levels = recorder.recent_levels()
+    assert levels == [1.0, 0.0]
+    assert all(0.0 <= value <= 1.0 for value in levels)
+
+
+def test_recent_levels_maxlen_and_reset(tmp_path: Path) -> None:
+    recorder = Recorder(tmp_path / "recordings")
+    for index in range(LEVEL_HISTORY_MAX + 60):
+        recorder._push_level((index % 100) / 100.0)  # noqa: SLF001
+    levels = recorder.recent_levels(10_000)
+    assert len(levels) == LEVEL_HISTORY_MAX
+    assert levels[-1] == pytest.approx(((LEVEL_HISTORY_MAX + 59) % 100) / 100.0)
+
+    recorder._reset_level_history()  # noqa: SLF001 start() 的内部清空逻辑
+    assert recorder.recent_levels() == []
+    assert recorder.level == 0.0
+
+
+def test_start_callback_populates_levels_and_wav(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """用假 sounddevice 验证「start 清空历史 → 回调写音量 → stop 保留历史 → 写 wav」。"""
+    recorder = Recorder(tmp_path / "recordings")
+    for _ in range(5):  # 上一轮录音残留的历史，start 时应被清空
+        recorder._push_level(0.9)  # noqa: SLF001
+    assert len(recorder.recent_levels()) == 5
+
+    fake_sd = _FakeSoundDevice()
+    monkeypatch.setattr(Recorder, "_import_sounddevice", staticmethod(lambda: fake_sd))
+    recorder.start()
+    try:
+        assert recorder.is_recording is True
+        # start 清空旧历史；假回调同步喂了一帧正弦波，所以只剩 1 个新值
+        levels = recorder.recent_levels()
+        assert len(levels) == 1
+        assert 0.0 < levels[0] <= 1.0
+        assert recorder.level == levels[0]
+        assert recorder.elapsed_seconds > 0.0
+        saved = recorder.stop()
+    finally:
+        if recorder.is_recording:  # 断言失败等异常路径下别把流晾着
+            recorder.cancel()
+
+    assert saved.is_file()
+    with wave.open(str(saved), "rb") as handle:
+        assert handle.getnchannels() == 1
+        assert handle.getsampwidth() == 2
+        assert handle.getframerate() == recorder.samplerate
+        assert handle.getnframes() == 512
+    # stop 后保留最后一批音量供界面定格，但 level 归零
+    assert recorder.recent_levels() == levels
+    assert recorder.level == 0.0
+    assert recorder.is_recording is False
+
+
+def test_cancel_clears_level_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder(tmp_path / "recordings")
+    fake_sd = _FakeSoundDevice()
+    monkeypatch.setattr(Recorder, "_import_sounddevice", staticmethod(lambda: fake_sd))
+    recorder.start()
+    assert recorder.recent_levels()  # 已有一帧音量
+    recorder.cancel()
+    assert recorder.recent_levels() == []
+    assert recorder.level == 0.0
+
+
+def test_recent_levels_with_real_microphone(tmp_path: Path) -> None:
+    """真实麦克风短录 0.3s：level 与 recent_levels 应有真实波形数据。"""
+    if not Recorder.available():
+        pytest.skip("当前机器没有可用输入设备")
+    recorder = Recorder(tmp_path / "recordings")
+    try:
+        recorder.start()
+    except errors.AudioError as exc:
+        pytest.skip(f"麦克风不可用：{exc}")
+    try:
+        time.sleep(0.3)
+        assert recorder.is_recording is True
+        live_level = recorder.level
+        live_levels = list(recorder.recent_levels())
+    finally:
+        try:
+            recorder.stop()
+        except errors.AudioError as exc:  # 没有采到数据（静音/独占等环境问题）
+            recorder.cancel()
+            pytest.skip(f"麦克风未采集到数据：{exc}")
+
+    final_levels = recorder.recent_levels()
+    assert final_levels, "真实录音后应保留音量历史"
+    assert len(final_levels) <= LEVEL_HISTORY_MAX
+    assert all(0.0 <= value <= 1.0 for value in final_levels)
+    assert live_levels, "录音中应能读到实时音量历史"
+    # 真实麦克风应能采到非零幅度；整段全为数字静音时无法验证，按环境问题跳过
+    if max(final_levels) <= 0.0:
+        pytest.skip("麦克风采集到的是纯数字静音，无法验证非零波形")
+    assert live_level >= 0.0
+    assert max(live_levels) > 0.0
+    assert recorder.level == 0.0  # 停止后电平归零
+    print(
+        f"\n[mic] 音量历史 {len(final_levels)} 个，"
+        f"min={min(final_levels):.4f} max={max(final_levels):.4f} "
+        f"mean={sum(final_levels)/len(final_levels):.4f}"
+    )
+    print("[mic] 最近 12 个音量值（旧→新）："
+          + ", ".join(f"{value:.3f}" for value in final_levels[-12:]))
 
 
 # ===========================================================================

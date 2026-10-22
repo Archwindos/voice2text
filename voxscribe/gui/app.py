@@ -1,12 +1,16 @@
-"""图形界面主窗口与启动入口。
+"""图形界面主窗口与启动入口（v1.1）。
 
-启动方式：``python -m voxscribe`` → :func:`voxscribe.gui.app.launch`。
+页面结构：
+* 首页「🎤 语音输入」：一键口述 → 本地转写 → DeepSeek「口述校对」→ 可编辑、
+  可复制的文字。大录音按钮 / F2 开始与结束，Canvas 实时波形，自动复制。
+* 「📁 文件转写」：原有的文件队列、批量处理、四格式导出、双标签预览。
+* 底部全局状态：进度条、状态文字、内存占用。
 
 线程模型：
 * 主线程只负责界面；
-* 点击「开始处理」后创建一个后台单工作线程，顺序处理队列中的文件；
-* 后台通过 ``queue.Queue`` 投递 :class:`voxscribe.models.JobEvent` 与
-  自定义 UI 消息，主线程每 100ms 轮询一次并刷新界面。
+* 语音输入与文件转写都在后台工作线程中执行，通过 ``ui_queue``
+  把 :class:`JobEvent` 与自定义 UI 消息投递回主线程，主线程每 100ms 轮询；
+* 关闭 / 取消通过 ``threading.Event`` 通知后台。
 
 测试辅助：环境变量 ``VOXSCRIBE_GUI_AUTOCLOSE_MS`` 存在时，窗口打开后
 指定毫秒自动关闭（用于烟雾测试 / 截图），不影响正常使用。
@@ -15,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import re
@@ -36,7 +41,14 @@ from ..config import (
     recordings_dir,
 )
 from ..errors import CancelledError, VoxError
-from ..models import EXPORT_FORMATS, STYLES, JobEvent, JobOptions, JobResult, format_timestamp
+from ..models import (
+    EXPORT_FORMATS,
+    STYLES,
+    JobEvent,
+    JobOptions,
+    JobResult,
+    format_timestamp,
+)
 from ..pipeline import Pipeline
 from ..util import human_duration, process_memory_mb, reveal_path
 from . import theme as theme_module
@@ -47,7 +59,13 @@ log = logging.getLogger(__name__)
 
 APP_TITLE = "语声成文 VoxScribe"
 APP_DISPLAY_NAME = "语声成文"
-APP_SUBTITLE = "本地转写 · DeepSeek 整理"
+APP_SUBTITLE = "口述成文 · 本地转写 + DeepSeek 整理"
+
+#: 首页固定使用的整理风格
+QUICK_STYLE = "proofread"
+QUICK_STYLE_LABEL = STYLES.get(QUICK_STYLE, "口述校对")
+HOME_PLACEHOLDER = "转换后的文字会出现在这里，可直接复制或修改"
+FULL_WIDTH_SPACE = "\u3000"
 
 AUDIO_EXTENSIONS = frozenset(
     {
@@ -61,7 +79,7 @@ AUDIO_FILETYPES = [
     ("所有文件", "*.*"),
 ]
 
-# 各阶段在整体进度中的权重（百分比）
+# 文件批量处理各阶段在整体进度中的权重（百分比）
 _STAGE_WEIGHTS = {
     "prepare": (0.0, 4.0),
     "asr": (4.0, 68.0),
@@ -69,6 +87,16 @@ _STAGE_WEIGHTS = {
     "export": (94.0, 100.0),
 }
 _STAGE_LABELS = {"prepare": "准备", "asr": "转写", "refine": "整理", "export": "导出"}
+
+# 首页语音输入各阶段权重
+_QUICK_STAGE_WEIGHTS = {
+    "prepare": (0.0, 3.0),
+    "asr": (3.0, 72.0),
+    "refine": (72.0, 100.0),
+}
+
+#: 波形柱数量（Recorder.recent_levels(90)）
+WAVE_BARS = 90
 
 _STATUS_TAGS = {
     "等待中": "pending",
@@ -92,7 +120,7 @@ except Exception:  # pragma: no cover
     TkinterDnD = None  # type: ignore[assignment]
     _DND_IMPORT_OK = False
 
-#: 可选依赖：录音（由 asr-dev 实现，未就绪时按钮自动禁用）
+#: 可选依赖：录音（未就绪时首页按钮自动禁用并提示）
 try:  # pragma: no cover - 取决于队友进度
     from ..recorder import Recorder  # type: ignore
 
@@ -102,6 +130,9 @@ except Exception:  # pragma: no cover
     _RECORDER_IMPORT_OK = False
 
 
+# ---------------------------------------------------------------------------
+# 小工具
+# ---------------------------------------------------------------------------
 def _shorten(text: str, limit: int = 60) -> str:
     text = (text or "").replace("\n", " ").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -119,6 +150,28 @@ def _read_autoclose_ms() -> int:
     return value if value > 0 else 0
 
 
+def _clamp01(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _blend_color(start: str, end: str, ratio: float) -> str:
+    """在两个 ``#rrggbb`` 颜色之间线性插值。"""
+    ratio = max(0.0, min(1.0, float(ratio)))
+
+    def _channel(value: str, index: int) -> int:
+        return int(value[1 + index * 2: 3 + index * 2], 16)
+
+    parts = []
+    for index in range(3):
+        start_value = _channel(start, index)
+        end_value = _channel(end, index)
+        parts.append(round(start_value + (end_value - start_value) * ratio))
+    return "#{:02x}{:02x}{:02x}".format(*parts)
+
+
 @dataclass
 class QueueFile:
     """待处理文件队列中的一项。"""
@@ -134,6 +187,7 @@ class MainWindow:
     POLL_MS = 100
     MEMORY_MS = 2000
     IDLE_CHECK_MS = 30000
+    WAVE_MS = 50
 
     def __init__(self, root: tk.Tk, settings: AppSettings) -> None:
         self.root = root
@@ -141,7 +195,10 @@ class MainWindow:
         self.theme: Theme = theme_module.apply_theme(root)
         self.pipeline = Pipeline(settings)
 
-        # ---- 运行时状态（先初始化，避免回调早于控件创建） ----
+        # ---- 页面 ----
+        self._page = "home"
+
+        # ---- 文件转写状态 ----
         self.ui_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.files: List[QueueFile] = []
         self.results: List[Tuple[QueueFile, JobResult]] = []
@@ -156,16 +213,34 @@ class MainWindow:
         self._last_result: Optional[JobResult] = None
         self._last_result_item: Optional[QueueFile] = None
         self._last_output_dir: Optional[Path] = None
+
+        # ---- 首页语音输入状态：idle / recording / converting ----
+        self._quick_state = "idle"
+        self._quick_cancel = threading.Event()
+        self._quick_worker: Optional[threading.Thread] = None
+        self._quick_seq = 0
+        self._quick_started = 0.0
+        self._quick_percent = 0.0
+        self._quick_stage_label = ""
+        self._quick_refine_used = False
+        self._quick_has_key = False
+        self._last_levels: List[float] = []
+        self._level_history: List[float] = []
+        self._wave_job: Optional[str] = None
+        self._wave_phase = 0
+        self._wave_idle_hint = ""
+        self._home_placeholder = True
+
+        # ---- 通用 ----
         self._closing = False
         self._save_job: Optional[str] = None
         self._poll_job: Optional[str] = None
         self._memory_job: Optional[str] = None
         self._idle_job: Optional[str] = None
-        self._record_job: Optional[str] = None
+        self._autoclose_job: Optional[str] = None
+        self._startup_jobs: List[str] = []
         self._recorder: Any = None
         self._recorder_note = ""
-        self._recording = False
-        self._record_started = 0.0
         self._syncing_options = False
         self._autoclose_ms = _read_autoclose_ms()
         self._dnd_available = _DND_AVAILABLE
@@ -179,6 +254,9 @@ class MainWindow:
         self._apply_settings_to_ui()
         self._refresh_file_list()
         self._bind_shortcuts()
+        self._set_home_timer(None)
+        self._set_home_mode_hint()
+        self._draw_home_idle()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.report_callback_exception = self._on_callback_exception
@@ -188,13 +266,13 @@ class MainWindow:
         self._poll_queue()
         if self._autoclose_ms:
             log.info("GUI 自动关闭已启用：%d ms（测试模式）", self._autoclose_ms)
-            self.root.after(self._autoclose_ms, self._on_close)
+            self._autoclose_job = self.root.after(self._autoclose_ms, self._on_close)
         else:
-            self.root.after(450, self._maybe_show_first_run)
-            self.root.after(700, self._startup_hints)
+            self._startup_jobs.append(self.root.after(450, self._maybe_show_first_run))
+            self._startup_jobs.append(self.root.after(700, self._startup_hints))
 
     # ==================================================================
-    # 窗口与布局
+    # 窗口与整体布局
     # ==================================================================
     def _configure_window(self) -> None:
         self.root.title(APP_TITLE)
@@ -230,24 +308,53 @@ class MainWindow:
                 self.root.geometry(f"{width}x{height}+{x}+{y}")
                 return
             log.info("保存的窗口位置不在屏幕内，改为居中显示：%r", saved.group(0))
-        center_window(self.root, theme.px(980), theme.px(720))
+        center_window(self.root, theme.px(980), theme.px(760))
 
     def _build_ui(self) -> None:
         theme = self.theme
         colors = COLORS
         root = self.root
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=0)
-        root.rowconfigure(1, weight=1)
-        root.rowconfigure(2, weight=0)
+        root.rowconfigure(0, weight=0)  # 标题栏
+        root.rowconfigure(1, weight=0)  # 导航
+        root.rowconfigure(2, weight=1)  # 页面
+        root.rowconfigure(3, weight=0)  # 全局状态栏
 
-        # ---------- 顶部标题栏 ----------
-        header = tk.Frame(root, bg=colors["header"], height=theme.px(80))
+        self._build_header(root)
+        self._build_nav(root)
+
+        self.page_container = tk.Frame(root, bg=colors["bg"])
+        self.page_container.grid(
+            row=2,
+            column=0,
+            sticky="nsew",
+            padx=theme.px(16),
+            pady=(theme.px(10), theme.px(2)),
+        )
+        self.page_container.columnconfigure(0, weight=1)
+        self.page_container.rowconfigure(0, weight=1)
+
+        self.home_page = self._build_home_page(self.page_container)
+        self.file_page = self._build_file_page(self.page_container)
+        self.home_page.grid(row=0, column=0, sticky="nsew")
+        self.file_page.grid(row=0, column=0, sticky="nsew")
+        self.file_page.grid_remove()
+
+        self._build_status_bar(root)
+        self._update_nav_styles()
+
+    # ------------------------------------------------------------------
+    # 顶部标题栏 + 页面导航
+    # ------------------------------------------------------------------
+    def _build_header(self, root: tk.Tk) -> None:
+        theme = self.theme
+        colors = COLORS
+        header = tk.Frame(root, bg=colors["header"], height=theme.px(72))
         header.grid(row=0, column=0, sticky="ew")
         header.pack_propagate(False)
 
         brand = tk.Frame(header, bg=colors["header"])
-        brand.pack(side="left", padx=(theme.px(22), 0), pady=theme.px(12))
+        brand.pack(side="left", padx=(theme.px(22), 0), pady=theme.px(10))
         title_row = tk.Frame(brand, bg=colors["header"])
         title_row.pack(anchor="w")
         tk.Label(
@@ -255,14 +362,14 @@ class MainWindow:
             text=APP_DISPLAY_NAME,
             bg=colors["header"],
             fg=colors["header_fg"],
-            font=theme.font(17, "bold"),
+            font=theme.font(16, "bold"),
         ).pack(side="left")
         tk.Label(
             title_row,
             text="VoxScribe",
             bg=colors["header"],
             fg=colors["header_sub"],
-            font=theme.font(12),
+            font=theme.font(11),
         ).pack(side="left", padx=(theme.px(8), 0), pady=(theme.px(4), 0))
         tk.Label(
             brand,
@@ -273,32 +380,78 @@ class MainWindow:
         ).pack(anchor="w", pady=(theme.px(1), 0))
 
         header_actions = tk.Frame(header, bg=colors["header"])
-        header_actions.pack(side="right", padx=(0, theme.px(18)), pady=theme.px(12))
+        header_actions.pack(side="right", padx=(0, theme.px(18)), pady=theme.px(10))
         self.help_btn = self._header_button(header_actions, "帮助", self._open_help)
         self.help_btn.pack(side="right", padx=(theme.px(6), 0))
         self.settings_btn = self._header_button(header_actions, "设置", self._open_settings)
         self.settings_btn.pack(side="right", padx=(theme.px(6), 0))
-        self.record_btn = self._header_button(
-            header_actions, "● 录音", self._toggle_recording, accent=True
-        )
-        self.record_btn.pack(side="right", padx=(0, theme.px(10)))
 
-        # ---------- 主体 ----------
-        main = tk.Frame(root, bg=colors["bg"])
-        main.grid(
-            row=1,
-            column=0,
-            sticky="nsew",
-            padx=theme.px(16),
-            pady=(theme.px(14), theme.px(6)),
-        )
-        main.columnconfigure(0, weight=0, minsize=theme.px(300))
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(0, weight=1)
+    def _build_nav(self, root: tk.Tk) -> None:
+        theme = self.theme
+        colors = COLORS
+        wrapper = tk.Frame(root, bg=colors["bg"])
+        wrapper.grid(row=1, column=0, sticky="ew", padx=theme.px(16), pady=(theme.px(8), 0))
 
-        self._build_file_panel(main)
-        self._build_right_panel(main)
-        self._build_bottom_bar(root)
+        nav = tk.Frame(wrapper, bg=colors["bg"])
+        nav.pack(fill="x")
+        self.nav_items: Dict[str, Tuple[tk.Button, tk.Frame]] = {}
+        for key, text in (("home", "🎤 语音输入"), ("files", "📁 文件转写")):
+            item = tk.Frame(nav, bg=colors["bg"])
+            item.pack(side="left", padx=(0, theme.px(4)))
+            button = tk.Button(
+                item,
+                text=text,
+                command=lambda page=key: self._switch_page(page),
+                bg=colors["bg"],
+                fg=colors["muted"],
+                activebackground=colors["primary_light"],
+                activeforeground=colors["primary_dark"],
+                font=theme.font(UI_SIZE + 1),
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                padx=theme.px(16),
+                pady=theme.px(7),
+                cursor="hand2",
+            )
+            button.pack()
+            underline = tk.Frame(item, bg=colors["bg"], height=theme.px(3))
+            underline.pack(fill="x")
+            self.nav_items[key] = (button, underline)
+
+        separator = tk.Frame(wrapper, bg=colors["border"], height=1)
+        separator.pack(fill="x", pady=(theme.px(4), 0))
+
+    def _update_nav_styles(self) -> None:
+        theme = self.theme
+        for key, (button, underline) in self.nav_items.items():
+            active = key == self._page
+            button.configure(
+                bg=COLORS["primary_light"] if active else COLORS["bg"],
+                fg=COLORS["primary_dark"] if active else COLORS["muted"],
+                font=theme.font(UI_SIZE + 1, "bold" if active else "normal"),
+            )
+            underline.configure(bg=COLORS["primary"] if active else COLORS["bg"])
+
+    def _switch_page(self, page: str) -> None:
+        if page == self._page:
+            return
+        if self._quick_state != "idle":
+            messagebox.showinfo(
+                "请先结束当前操作",
+                "正在录音或转换文字，请先结束（再按一次 F2）或按 Esc 取消后再切换页面。",
+                parent=self.root,
+            )
+            return
+        self._page = page
+        if page == "home":
+            self.file_page.grid_remove()
+            self.home_page.grid()
+            self._draw_home_idle(self._wave_idle_hint or None)
+        else:
+            self.home_page.grid_remove()
+            self.file_page.grid()
+        self._update_nav_styles()
 
     def _header_button(
         self, parent: tk.Misc, text: str, command: Any, *, accent: bool = False
@@ -409,8 +562,957 @@ class MainWindow:
             cursor="hand2",
         )
 
+    def _card_checkbutton(
+        self,
+        parent: tk.Misc,
+        text: str,
+        variable: tk.BooleanVar,
+        command: Any = None,
+    ) -> tk.Checkbutton:
+        """白色卡片上的经典复选框（比 clam 主题的 ✕ 样式更直观）。"""
+        theme = self.theme
+        colors = COLORS
+        return tk.Checkbutton(
+            parent,
+            text=text,
+            variable=variable,
+            command=command,
+            bg=colors["card"],
+            fg=colors["text"],
+            activebackground=colors["card"],
+            activeforeground=colors["text"],
+            selectcolor=colors["card"],
+            disabledforeground=colors["faint"],
+            font=theme.font(UI_SIZE),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+            anchor="w",
+        )
+
+    # ==================================================================
+    # 首页：语音输入
+    # ==================================================================
+    def _build_home_page(self, parent: tk.Frame) -> tk.Frame:
+        theme = self.theme
+        colors = COLORS
+        page = tk.Frame(parent, bg=colors["bg"])
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=0)
+        page.rowconfigure(1, weight=1)
+
+        # ---------- 录音 + 波形 ----------
+        input_card, input_body = theme_module.make_card(page, theme)
+        input_card.grid(row=0, column=0, sticky="ew")
+
+        self.home_record_btn = tk.Button(
+            input_body,
+            text=f"● 开始录音{FULL_WIDTH_SPACE}F2",
+            command=self._toggle_quick,
+            bg=colors["primary"],
+            fg="#ffffff",
+            activebackground=colors["primary_dark"],
+            activeforeground="#ffffff",
+            disabledforeground="#ffffff",
+            font=theme.font(18, "bold"),
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=theme.px(68),
+            pady=theme.px(16),
+            cursor="hand2",
+        )
+        self.home_record_btn.pack(pady=(theme.px(6), theme.px(8)))
+
+        self.home_timer_var = tk.StringVar(value="")
+        self.home_timer_label = tk.Label(
+            input_body,
+            textvariable=self.home_timer_var,
+            bg=colors["card"],
+            fg=colors["primary_dark"],
+            font=theme.mono(16),
+            anchor="center",
+        )
+        self.home_timer_label.pack_forget()
+
+        self.home_status_var = tk.StringVar(value="不用打字：按 F2 说一段，再按一次结束")
+        self.home_status_label = tk.Label(
+            input_body,
+            textvariable=self.home_status_var,
+            bg=colors["card"],
+            fg=colors["muted"],
+            font=theme.font(UI_SIZE),
+            anchor="center",
+        )
+        self.home_status_label.pack(fill="x")
+
+        self.home_mode_var = tk.StringVar(value="")
+        self.home_mode_label = tk.Label(
+            input_body,
+            textvariable=self.home_mode_var,
+            bg=colors["card"],
+            fg=colors["muted"],
+            font=theme.font(SMALL_SIZE),
+            anchor="center",
+        )
+        self.home_mode_label.pack(fill="x", pady=(theme.px(2), theme.px(6)))
+
+        self.wave_canvas = tk.Canvas(
+            input_body,
+            height=theme.px(150),
+            bg=colors["wave_bg"],
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            bd=0,
+        )
+        self.wave_canvas.pack(fill="x")
+        self.wave_canvas.bind("<Configure>", self._on_wave_configure)
+
+        # ---------- 结果文本 ----------
+        result_card, result_body = theme_module.make_card(page, theme, "转换结果")
+        result_card.grid(row=1, column=0, sticky="nsew", pady=(theme.px(12), 0))
+        result_body.columnconfigure(0, weight=1)
+        result_body.rowconfigure(0, weight=1)
+
+        text_wrap = tk.Frame(result_body, bg=colors["card"])
+        text_wrap.grid(row=0, column=0, sticky="nsew")
+        text_wrap.columnconfigure(0, weight=1)
+        text_wrap.rowconfigure(0, weight=1)
+        self.home_text = tk.Text(
+            text_wrap,
+            wrap="word",
+            font=theme.font(BODY_SIZE),
+            bg="#fdfefe",
+            fg=colors["text"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            highlightcolor=colors["primary"],
+            padx=theme.px(12),
+            pady=theme.px(10),
+            spacing1=theme.px(2),
+            spacing3=theme.px(4),
+            selectbackground=colors["primary_light"],
+            selectforeground=colors["text"],
+            insertbackground=colors["text"],
+        )
+        text_scroll = ttk.Scrollbar(
+            text_wrap, orient="vertical", command=self.home_text.yview
+        )
+        self.home_text.configure(yscrollcommand=text_scroll.set)
+        self.home_text.grid(row=0, column=0, sticky="nsew")
+        text_scroll.grid(row=0, column=1, sticky="ns")
+        self.home_text.tag_configure("placeholder", foreground=colors["faint"])
+        self.home_text.bind("<FocusIn>", self._on_home_text_focus_in)
+        self.home_text.bind("<FocusOut>", self._on_home_text_focus_out)
+        self.home_text.bind("<Control-Return>", self._on_home_copy_shortcut)
+
+        self.home_inline_hint = tk.Label(
+            result_body,
+            text="",
+            bg=colors["card"],
+            fg=colors["warning"],
+            font=theme.font(SMALL_SIZE),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(760),
+        )
+        self.home_inline_hint.grid(row=1, column=0, sticky="w", pady=(theme.px(6), 0))
+        self.home_inline_hint.grid_remove()
+
+        result_actions = tk.Frame(result_body, bg=colors["card"])
+        result_actions.grid(row=2, column=0, sticky="ew", pady=(theme.px(8), 0))
+
+        self.auto_copy_var = tk.BooleanVar(
+            value=bool(getattr(self.settings, "auto_copy", True))
+        )
+        self.auto_copy_check = self._card_checkbutton(
+            result_actions,
+            "完成后自动复制到剪贴板",
+            self.auto_copy_var,
+            self._on_auto_copy_changed,
+        )
+        self.auto_copy_check.pack(side="left")
+
+        self.home_clear_btn = self._panel_button(
+            result_actions, "清空", self._clear_home_text
+        )
+        self.home_clear_btn.pack(side="right")
+        self.home_copy_btn = self._panel_button(
+            result_actions, "复制文字", lambda: self._copy_home_text(), accent=True
+        )
+        self.home_copy_btn.pack(side="right", padx=(0, theme.px(8)))
+
+        self._show_home_placeholder()
+        return page
+
     # ------------------------------------------------------------------
-    # 左侧：待处理文件
+    # 首页：文本区
+    # ------------------------------------------------------------------
+    def _show_home_placeholder(self) -> None:
+        self.home_text.delete("1.0", "end")
+        self.home_text.insert("1.0", HOME_PLACEHOLDER, "placeholder")
+        self._home_placeholder = True
+
+    def _on_home_text_focus_in(self, _event: Any = None) -> None:
+        if self._home_placeholder:
+            self.home_text.delete("1.0", "end")
+            self._home_placeholder = False
+
+    def _on_home_text_focus_out(self, _event: Any = None) -> None:
+        if not self._home_placeholder and not self.home_text.get("1.0", "end-1c").strip():
+            self._show_home_placeholder()
+
+    def _set_home_text(self, text: str) -> None:
+        self.home_text.delete("1.0", "end")
+        if text:
+            self.home_text.insert("1.0", text)
+            self._home_placeholder = False
+        else:
+            self.home_text.insert("1.0", HOME_PLACEHOLDER, "placeholder")
+            self._home_placeholder = True
+
+    def _get_home_text(self) -> str:
+        if self._home_placeholder:
+            return ""
+        return self.home_text.get("1.0", "end-1c").strip()
+
+    def _clear_home_text(self) -> None:
+        self._show_home_placeholder()
+        self._set_home_status("已清空文字，可以重新说一段。")
+        self._set_status("语音输入：已清空转换结果")
+
+    def _copy_home_text(self, *, silent: bool = False) -> bool:
+        text = self._get_home_text()
+        if not text:
+            if not silent:
+                messagebox.showinfo(
+                    "还没有文字",
+                    "先说一句话，或在下方文本框中输入文字后再复制。",
+                    parent=self.root,
+                )
+            return False
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except tk.TclError as exc:  # pragma: no cover - 剪贴板不可用
+            if not silent:
+                messagebox.showerror(
+                    "复制失败", f"无法访问剪贴板：{exc}", parent=self.root
+                )
+            return False
+        if not silent:
+            self._set_home_status(f"已复制 {len(text)} 字到剪贴板")
+            self._set_status(f"语音输入：已复制 {len(text)} 字到剪贴板")
+        return True
+
+    def _on_home_copy_shortcut(self, _event: Any = None) -> str:
+        self._copy_home_text()
+        return "break"
+
+    def _on_auto_copy_changed(self) -> None:
+        if self._closing:
+            return
+        self.settings.auto_copy = bool(self.auto_copy_var.get())
+        self._schedule_save()
+
+    # ------------------------------------------------------------------
+    # 首页：状态显示
+    # ------------------------------------------------------------------
+    def _set_home_status(self, text: str) -> None:
+        try:
+            self.home_status_var.set(text)
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _set_home_timer(self, text: Optional[str]) -> None:
+        try:
+            if text:
+                self.home_timer_var.set(text)
+                if not self.home_timer_label.winfo_manager():
+                    self.home_timer_label.pack(before=self.home_status_label)
+            else:
+                self.home_timer_var.set("")
+                self.home_timer_label.pack_forget()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _set_home_mode_hint(self) -> None:
+        if self._processing:
+            text = "文件转写任务进行中，语音输入暂不可用"
+            color = COLORS["warning"]
+        elif self._recorder is None:
+            text = "未检测到麦克风 · 录音不可用（可使用「文件转写」）"
+            color = COLORS["warning"]
+        elif self.settings.has_api_key:
+            text = f"AI 整理已就绪 · {QUICK_STYLE_LABEL}"
+            color = COLORS["muted"]
+        else:
+            text = "未配置 DeepSeek Key · 仅本地转写（可在「设置」中启用 AI 整理）"
+            color = COLORS["warning"]
+        try:
+            self.home_mode_var.set(text)
+            self.home_mode_label.configure(fg=color)
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _show_home_inline_hint(self, text: str, *, warning: bool = True) -> None:
+        try:
+            self.home_inline_hint.configure(
+                text=text, fg=COLORS["warning"] if warning else COLORS["muted"]
+            )
+            self.home_inline_hint.grid()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _hide_home_inline_hint(self) -> None:
+        try:
+            self.home_inline_hint.grid_remove()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    # ------------------------------------------------------------------
+    # 首页：波形绘制
+    # ------------------------------------------------------------------
+    def _wave_canvas_size(self) -> Tuple[int, int]:
+        try:
+            width = self.wave_canvas.winfo_width()
+            height = self.wave_canvas.winfo_height()
+        except tk.TclError:  # pragma: no cover
+            width, height = 0, 0
+        if width <= 10:
+            width = self.theme.px(860)
+        if height <= 10:
+            height = self.theme.px(150)
+        return int(width), int(height)
+
+    def _on_wave_configure(self, _event: Any = None) -> None:
+        if self._quick_state == "recording":
+            self._draw_home_recording(self._last_levels)
+        elif self._quick_state == "converting":
+            self._draw_home_converting()
+        else:
+            self._draw_home_idle(self._wave_idle_hint or None)
+
+    def _draw_home_idle(self, message: Optional[str] = None) -> None:
+        try:
+            self.wave_canvas.delete("all")
+            width, height = self._wave_canvas_size()
+            middle = height / 2
+            self.wave_canvas.create_line(
+                0, middle, width, middle, fill=COLORS["border"], width=1
+            )
+            text = message or "说一句，立刻成文"
+            self.wave_canvas.create_text(
+                width / 2,
+                middle - self.theme.px(24),
+                text=text,
+                fill=COLORS["muted"],
+                font=self.theme.font(UI_SIZE + 2),
+            )
+            if message is None:
+                self.wave_canvas.create_text(
+                    width / 2,
+                    middle + self.theme.px(24),
+                    text=f"识别模型 {self.settings.asr_model}"
+                    f" · 整理风格 {QUICK_STYLE_LABEL} · 本地转写",
+                    fill=COLORS["faint"],
+                    font=self.theme.font(SMALL_SIZE),
+                )
+        except tk.TclError:  # pragma: no cover - 窗口销毁中
+            pass
+
+    def _draw_home_recording(self, levels: List[float]) -> None:
+        try:
+            self.wave_canvas.delete("all")
+            width, height = self._wave_canvas_size()
+            middle = height / 2
+            theme = self.theme
+            self.wave_canvas.create_line(
+                0, middle, width, middle, fill=COLORS["border"], width=1
+            )
+            values = list(levels or [])[-WAVE_BARS:]
+            if not values:
+                self.wave_canvas.create_text(
+                    width / 2,
+                    middle,
+                    text="正在聆听…",
+                    fill=COLORS["muted"],
+                    font=theme.font(UI_SIZE + 1),
+                )
+                return
+            slot = width / float(WAVE_BARS)
+            bar_width = max(theme.px(2), int(slot * 0.55))
+            min_height = theme.px(2)
+            offset = WAVE_BARS - len(values)
+            for index, value in enumerate(values):
+                x = (offset + index + 0.5) * slot
+                level = max(0.0, min(1.0, value))
+                if level < 0.01:  # 噪声门：安静时画最小柱，避免波形像一条直线
+                    amplitude = min_height
+                else:
+                    # 视觉放大：安静环境 0.008 接近平线，正常说话 0.2~0.8 起伏明显
+                    visual = min(1.0, level * 1.6) ** 0.8
+                    amplitude = max(min_height, visual * (height * 0.42))
+                ratio = (index + 1) / float(len(values))
+                color = _blend_color(COLORS["wave_old"], COLORS["wave_new"], ratio)
+                self.wave_canvas.create_line(
+                    x,
+                    middle - amplitude,
+                    x,
+                    middle + amplitude,
+                    fill=color,
+                    width=bar_width,
+                    capstyle="round",
+                )
+        except tk.TclError:  # pragma: no cover - 窗口销毁中
+            pass
+
+    def _draw_home_converting(self) -> None:
+        try:
+            self.wave_canvas.delete("all")
+            width, height = self._wave_canvas_size()
+            middle = height / 2
+            theme = self.theme
+            self.wave_canvas.create_line(
+                0, middle, width, middle, fill=COLORS["border"], width=1
+            )
+            values = list(self._last_levels or [])[-WAVE_BARS:]
+            if values:
+                slot = width / float(WAVE_BARS)
+                bar_width = max(theme.px(2), int(slot * 0.5))
+                offset = WAVE_BARS - len(values)
+                for index, value in enumerate(values):
+                    x = (offset + index + 0.5) * slot
+                    level = max(0.0, min(1.0, value))
+                    amplitude = max(
+                        theme.px(1), (min(1.0, level * 1.6) ** 0.8) * (height * 0.30)
+                    )
+                    self.wave_canvas.create_line(
+                        x,
+                        middle - amplitude,
+                        x,
+                        middle + amplitude,
+                        fill=COLORS["wave_frozen"],
+                        width=bar_width,
+                        capstyle="round",
+                    )
+
+            label = f"{self._quick_stage_label or '正在转写…'}"
+            if self._quick_percent > 0:
+                label += f"  {int(round(self._quick_percent))}%"
+            box_width = min(width - theme.px(32), theme.px(330))
+            box_height = theme.px(74)
+            x0 = (width - box_width) / 2
+            y0 = middle - box_height / 2
+            self.wave_canvas.create_rectangle(
+                x0,
+                y0,
+                x0 + box_width,
+                y0 + box_height,
+                fill=COLORS["card"],
+                outline=COLORS["border"],
+            )
+            phase = self._wave_phase * 0.35
+            for index in range(3):
+                radius = theme.px(3) + theme.px(3) * max(
+                    0.0, math.sin(phase + index * 0.9)
+                )
+                center_x = width / 2 + (index - 1) * theme.px(18)
+                center_y = y0 + theme.px(20)
+                self.wave_canvas.create_oval(
+                    center_x - radius,
+                    center_y - radius,
+                    center_x + radius,
+                    center_y + radius,
+                    fill=COLORS["primary"],
+                    outline="",
+                )
+            self.wave_canvas.create_text(
+                width / 2,
+                y0 + theme.px(50),
+                text=label,
+                fill=COLORS["primary_dark"],
+                font=theme.font(UI_SIZE + 1, "bold"),
+            )
+        except tk.TclError:  # pragma: no cover - 窗口销毁中
+            pass
+
+    # ------------------------------------------------------------------
+    # 首页：录音 / 转换状态机
+    # ------------------------------------------------------------------
+    def _recording_elapsed(self) -> float:
+        try:
+            if self._recorder is not None:
+                return max(0.0, float(self._recorder.elapsed_seconds))
+        except Exception:  # pragma: no cover - 录音器状态不可用
+            pass
+        return max(0.0, time.monotonic() - self._quick_started)
+
+    def _quick_elapsed(self) -> float:
+        return max(0.0, time.monotonic() - self._quick_started)
+
+    def _toggle_quick(self) -> None:
+        if self._closing:
+            return
+        if self._quick_state == "recording":
+            self._quick_stop_and_convert()
+        elif self._quick_state == "converting":
+            return
+        else:
+            self._quick_start()
+
+    def _on_f2(self, _event: Any = None) -> None:
+        self._toggle_quick()
+
+    def _quick_start(self) -> None:
+        if self._quick_state != "idle":
+            return
+        if self._processing:
+            messagebox.showinfo(
+                "文件转写进行中",
+                "批量文件转写还在进行，请等它完成后再使用语音输入。",
+                parent=self.root,
+            )
+            return
+        if self._recorder is None:
+            messagebox.showinfo(
+                "录音不可用",
+                self._recorder_note
+                or "未检测到可用的麦克风。请检查系统麦克风设备后重新打开程序。",
+                parent=self.root,
+            )
+            return
+        try:
+            self._recorder.start()
+        except NotImplementedError:
+            messagebox.showinfo(
+                "录音暂不可用", "录音模块尚未完成，请稍后再试。", parent=self.root
+            )
+            return
+        except VoxError as exc:
+            detail = str(exc)
+            if exc.user_hint:
+                detail += f"\n\n提示：{exc.user_hint}"
+            messagebox.showerror("无法开始录音", detail, parent=self.root)
+            return
+        except Exception as exc:  # pragma: no cover - 设备级异常
+            log.exception("启动录音失败")
+            messagebox.showerror(
+                "无法开始录音",
+                f"启动录音失败：{exc}\n\n请检查麦克风是否被其他程序占用。",
+                parent=self.root,
+            )
+            return
+
+        self._quick_state = "recording"
+        self._quick_has_key = self.settings.has_api_key
+        self._quick_refine_used = False
+        self._quick_started = time.monotonic()
+        self._last_levels = []
+        self._level_history = []
+        self._wave_phase = 0
+        self._wave_idle_hint = ""
+        self._set_home_timer("00:00")
+        self._set_home_status("正在聆听，请说话…")
+        self._hide_home_inline_hint()
+        self._refresh_action_states()
+        self._draw_home_recording([])
+        self._start_wave_tick()
+        self._set_status("语音输入：正在录音…（再按 F2 或点击按钮结束）")
+
+    def _quick_stop_and_convert(self) -> None:
+        if self._quick_state != "recording":
+            return
+        self._stop_wave_tick()
+        wav_path: Optional[Path] = None
+        try:
+            if self._recorder is not None:
+                wav_path = self._recorder.stop()
+        except NotImplementedError:
+            wav_path = None
+        except VoxError as exc:
+            detail = str(exc)
+            if exc.user_hint:
+                detail += f"\n\n提示：{exc.user_hint}"
+            self._reset_quick_idle(
+                status="录音没有保存，请再试一次。",
+                wave_hint="录音未保存，可以重新开始",
+            )
+            messagebox.showerror("录音保存失败", detail, parent=self.root)
+            return
+        except Exception as exc:  # pragma: no cover - 设备级异常
+            log.exception("停止录音失败")
+            self._reset_quick_idle(
+                status="录音保存失败，请再试一次。",
+                wave_hint="录音保存失败，可以重新开始",
+            )
+            messagebox.showerror(
+                "录音保存失败", f"无法保存录音：{exc}", parent=self.root
+            )
+            return
+
+        if wav_path is None:
+            self._reset_quick_idle(
+                status="没有录到声音，请再试一次。",
+                wave_hint="没有录到声音，可以重新开始",
+            )
+            return
+        self._start_quick_conversion(Path(wav_path))
+
+    def _start_quick_conversion(self, audio_path: Path) -> None:
+        """后台执行「转写 + DeepSeek 口述校对」，不写文件。"""
+        refine = self.settings.has_api_key
+        job = JobOptions(
+            refine=refine,
+            style=QUICK_STYLE,
+            language=self.settings.language,
+            export_formats=[],
+        )
+        self._quick_state = "converting"
+        self._quick_seq += 1
+        seq = self._quick_seq
+        self._quick_cancel = threading.Event()
+        self._quick_started = time.monotonic()
+        self._quick_has_key = refine
+        self._quick_refine_used = refine
+        self._quick_stage_label = "正在转写…"
+        self._quick_percent = 0.0
+        self._wave_phase = 0
+        self._set_home_timer("00:00")
+        self._set_home_status(f"正在转写…{' 随后 DeepSeek 整理' if refine else ''}")
+        if not refine:
+            self._show_home_inline_hint(
+                "未配置 DeepSeek Key：本次只做本地转写。可在「设置」中填写 Key 启用 AI 整理。"
+            )
+        else:
+            self._hide_home_inline_hint()
+        self._refresh_action_states()
+        self._draw_home_converting()
+        self._start_wave_tick()
+        self.progress_var.set(0.0)
+        self._set_status(
+            "语音输入：正在转写" + ("并整理…" if refine else "（仅本地转写）…")
+        )
+
+        emit = lambda event: self.ui_queue.put(("quick_event", seq, event))
+
+        def worker() -> None:
+            try:
+                result = self.pipeline.transcribe_and_refine(
+                    audio_path, job, emit, self._quick_cancel
+                )
+            except CancelledError:
+                self.ui_queue.put(("quick_cancelled", seq, None))
+            except Exception as exc:  # 交给主线程弹窗 + 恢复状态
+                log.exception("语音输入转换失败")
+                self.ui_queue.put(("quick_error", seq, exc))
+            else:
+                self.ui_queue.put(("quick_done", seq, result))
+
+        self._quick_worker = threading.Thread(
+            target=worker, name="voxscribe-quick", daemon=True
+        )
+        self._quick_worker.start()
+
+    def _reset_quick_idle(self, *, status: str, wave_hint: str = "") -> None:
+        self._stop_wave_tick()
+        self._quick_state = "idle"
+        self._set_home_timer(None)
+        self._set_home_status(status)
+        self._set_status("语音输入：" + status)
+        self._wave_idle_hint = wave_hint
+        self.progress_var.set(0.0)
+        self._draw_home_idle(wave_hint or None)
+        self._refresh_action_states()
+        self._set_home_mode_hint()
+
+    def _cancel_quick_recording(self) -> None:
+        if self._quick_state != "recording":
+            return
+        try:
+            if self._recorder is not None:
+                self._recorder.cancel()
+        except NotImplementedError:
+            pass
+        except Exception:  # pragma: no cover - 设备级异常
+            log.warning("取消录音失败", exc_info=True)
+        self._reset_quick_idle(
+            status="录音已取消（未保存）。",
+            wave_hint="录音已取消，可以重新开始",
+        )
+
+    def _cancel_quick_conversion(self) -> None:
+        if self._quick_state != "converting":
+            return
+        self._quick_cancel.set()
+        self._set_home_status("正在取消…")
+        self._set_status("语音输入：正在取消转换…")
+        self._quick_stage_label = "正在取消…"
+
+    def _on_quick_event(self, event: JobEvent) -> None:
+        stage = (event.stage or "").strip()
+        if stage in _QUICK_STAGE_WEIGHTS:
+            start, end = _QUICK_STAGE_WEIGHTS[stage]
+            ratio = event.progress if event.progress is not None else 0.0
+            ratio = max(0.0, min(1.0, float(ratio))) if ratio >= 0 else 0.0
+            self._quick_percent = start + (end - start) * ratio
+            self.progress_var.set(self._quick_percent)
+            label = "正在转写…" if stage in ("prepare", "asr") else "DeepSeek 整理中…"
+            self._quick_stage_label = label
+            self._set_home_status(f"{label}  {int(round(self._quick_percent))}%")
+            message = _shorten(event.message or label, 44)
+            self._set_status(f"语音输入：{label} {message}")
+        elif stage == "done":
+            self.progress_var.set(100.0)
+            self._set_status(f"语音输入：{event.message or '转换完成'}")
+
+    def _on_quick_done(self, result: JobResult) -> None:
+        self._stop_wave_tick()
+        self._quick_state = "idle"
+        # 最终状态一律以 JobResult.refined 为准，避免「未配置 Key」等中间状态串台
+        refined = bool(result.refined and (result.refined.text or "").strip())
+        text = (result.final_text or "").strip()
+        self._set_home_text(text)
+        elapsed = result.elapsed or self._quick_elapsed()
+        chars = len(text)
+        if refined:
+            status_text = f"AI 已整理 · 用时 {elapsed:.1f} 秒 · {chars} 字"
+        else:
+            status_text = f"仅本地转写 · 用时 {elapsed:.1f} 秒 · {chars} 字"
+        copied = False
+        if self.settings.auto_copy and text:
+            copied = self._copy_home_text(silent=True)
+            if copied:
+                status_text += " · 已复制到剪贴板"
+        self._set_home_timer(None)
+        self._set_home_status(status_text)
+        self._set_status("语音输入：" + status_text)
+        self._wave_idle_hint = (
+            "AI 已整理，可在下方复制或修改"
+            if refined
+            else "已转写，可在下方复制或修改"
+        )
+        self.progress_var.set(0.0)
+        self._draw_home_idle(self._wave_idle_hint)
+        if refined:
+            self._show_home_inline_hint(
+                f"已由 DeepSeek「{QUICK_STYLE_LABEL}」整理，可直接修改或复制。",
+                warning=False,
+            )
+        elif not self.settings.has_api_key:
+            self._show_home_inline_hint(
+                "未配置 DeepSeek Key：本次只做本地转写。可在「设置」中填写 Key 启用 AI 整理。"
+            )
+        else:
+            self._show_home_inline_hint(
+                "本次仅本地转写：AI 整理未生效。可检查「设置 → DeepSeek」后重新录音。"
+            )
+        self._refresh_action_states()
+        self._set_home_mode_hint()
+
+    def _on_quick_cancelled(self) -> None:
+        self._reset_quick_idle(
+            status="转换已取消。",
+            wave_hint="转换已取消，可以重新说一段",
+        )
+
+    def _on_quick_error(self, exc: BaseException) -> None:
+        message = str(exc).strip() or type(exc).__name__
+        hint = ""
+        if isinstance(exc, VoxError):
+            hint = (exc.user_hint or "").strip()
+        elif isinstance(exc, NotImplementedError):
+            hint = "对应功能模块尚未完成，请稍后再试。"
+        else:
+            hint = "请查看 data/logs/app.log 了解详细信息。"
+        self._reset_quick_idle(
+            status="转换失败，请再试一次。",
+            wave_hint="转换失败，可以重新开始",
+        )
+        detail = message
+        if hint:
+            detail += f"\n\n提示：{hint}"
+        messagebox.showerror("语音输入失败", detail, parent=self.root)
+
+    # ------------------------------------------------------------------
+    # 首页：波形定时器
+    # ------------------------------------------------------------------
+    def _start_wave_tick(self) -> None:
+        self._stop_wave_tick()
+        try:
+            self._wave_job = self.root.after(0, self._wave_tick)
+        except tk.TclError:  # pragma: no cover
+            self._wave_job = None
+
+    def _stop_wave_tick(self) -> None:
+        if self._wave_job is not None:
+            try:
+                self.root.after_cancel(self._wave_job)
+            except Exception:  # pragma: no cover
+                pass
+            self._wave_job = None
+
+    def _wave_tick(self) -> None:
+        self._wave_job = None
+        if self._closing:
+            return
+        if self._quick_state == "recording":
+            levels = self._read_levels()
+            self._last_levels = levels
+            self._draw_home_recording(levels)
+            self._set_home_timer(format_timestamp(self._recording_elapsed()))
+            self._set_home_status("正在聆听，请说话…")
+        elif self._quick_state == "converting":
+            self._wave_phase += 1
+            self._draw_home_converting()
+            self._set_home_timer(format_timestamp(self._quick_elapsed()))
+        else:
+            return
+        try:
+            self._wave_job = self.root.after(self.WAVE_MS, self._wave_tick)
+        except tk.TclError:  # pragma: no cover
+            self._wave_job = None
+
+    def _read_levels(self) -> List[float]:
+        """读取实时音量：优先 Recorder.recent_levels，退化为 level 自行累积。"""
+        if self._recorder is None:
+            return []
+        try:
+            getter = getattr(self._recorder, "recent_levels", None)
+            if callable(getter):
+                raw = getter(WAVE_BARS)
+                values = [
+                    _clamp01(value)
+                    for value in (raw or [])
+                    if isinstance(value, (int, float))
+                ]
+                if values:
+                    return values[-WAVE_BARS:]
+        except NotImplementedError:  # 队友实现尚未就绪
+            pass
+        except Exception:  # pragma: no cover - 录音器状态不可用
+            log.debug("读取录音波形失败", exc_info=True)
+        try:
+            level = getattr(self._recorder, "level", None)
+            if level is not None:
+                self._level_history.append(_clamp01(level))
+                del self._level_history[:-WAVE_BARS]
+                return list(self._level_history)
+        except NotImplementedError:
+            pass
+        except Exception:  # pragma: no cover
+            log.debug("读取录音音量失败", exc_info=True)
+        return []
+
+    # ------------------------------------------------------------------
+    # 首页：统一刷新按钮状态
+    # ------------------------------------------------------------------
+    def _refresh_action_states(self) -> None:
+        quick_idle = self._quick_state == "idle"
+        recorder_ok = self._recorder is not None
+        try:
+            button = self.home_record_btn
+            if self._quick_state == "recording":
+                button.configure(
+                    text=f"■ 停止并转换{FULL_WIDTH_SPACE}F2",
+                    bg=COLORS["record"],
+                    activebackground=COLORS["record_dark"],
+                    fg="#ffffff",
+                    state="normal",
+                    cursor="hand2",
+                )
+            elif self._quick_state == "converting":
+                button.configure(
+                    text="转换中…",
+                    bg=COLORS["trough"],
+                    activebackground=COLORS["trough"],
+                    fg=COLORS["muted"],
+                    state="disabled",
+                    cursor="arrow",
+                )
+            else:
+                if recorder_ok and not self._processing:
+                    button.configure(
+                        text=f"● 开始录音{FULL_WIDTH_SPACE}F2",
+                        bg=COLORS["primary"],
+                        activebackground=COLORS["primary_dark"],
+                        fg="#ffffff",
+                        state="normal",
+                        cursor="hand2",
+                    )
+                else:
+                    button.configure(
+                        text="● 录音不可用",
+                        bg=COLORS["trough"],
+                        activebackground=COLORS["trough"],
+                        fg=COLORS["muted"],
+                        state="disabled",
+                        cursor="arrow",
+                    )
+            enabled = (not self._processing) and quick_idle
+            self.start_btn.configure(
+                state="normal" if enabled else "disabled",
+                text="处理中…" if self._processing else "开始处理",
+            )
+            self.cancel_btn.configure(
+                state="normal" if self._processing else "disabled"
+            )
+            for button in (self.add_btn, self.remove_btn, self.clear_btn):
+                button.configure(
+                    state="disabled" if self._processing else "normal"
+                )
+            self.settings_btn.configure(
+                state="normal" if (quick_idle and not self._processing) else "disabled"
+            )
+            self._set_options_enabled(quick_idle and not self._processing)
+        except (tk.TclError, AttributeError):  # pragma: no cover - 构建期调用
+            return
+        self._set_home_mode_hint()
+
+    # ==================================================================
+    # 文件转写页
+    # ==================================================================
+    def _build_file_page(self, parent: tk.Frame) -> tk.Frame:
+        theme = self.theme
+        colors = COLORS
+        page = tk.Frame(parent, bg=colors["bg"])
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=1)
+
+        main = tk.Frame(page, bg=colors["bg"])
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=0, minsize=theme.px(300))
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+        self._build_file_panel(main)
+        self._build_right_panel(main)
+
+        actions = tk.Frame(page, bg=colors["bg"])
+        actions.grid(row=1, column=0, sticky="ew", pady=(theme.px(10), 0))
+        self.start_btn = self._action_button(
+            actions, "开始处理", self._start_processing, primary=True
+        )
+        self.start_btn.pack(side="right")
+        self.cancel_btn = self._action_button(
+            actions, "取消", self._cancel_processing, danger=True
+        )
+        self.cancel_btn.configure(state="disabled")
+        self.cancel_btn.pack(side="right", padx=(0, theme.px(8)))
+        self.copy_btn = self._action_button(
+            actions, "复制整理稿", self._copy_result
+        )
+        self.copy_btn.pack(side="left")
+        self.open_dir_btn = self._action_button(
+            actions, "打开输出目录", self._open_output_dir
+        )
+        self.open_dir_btn.pack(side="left", padx=(theme.px(8), 0))
+        return page
+
+    # ------------------------------------------------------------------
+    # 文件转写：左侧文件队列
     # ------------------------------------------------------------------
     def _build_file_panel(self, parent: tk.Frame) -> None:
         theme = self.theme
@@ -483,7 +1585,6 @@ class MainWindow:
         self.file_tree.tag_configure("failed", foreground=colors["danger"])
         self.file_tree.bind("<Delete>", lambda _event: self._remove_selected())
         self.file_tree.bind("<Control-a>", self._select_all_files)
-        body.bind("<Button-1>", self._clear_tree_selection, add="+")
 
         self.file_hint_var = tk.StringVar(value="支持 mp3 / wav / m4a 等格式 · 音频仅在本机处理")
         tk.Label(
@@ -503,14 +1604,8 @@ class MainWindow:
             self.file_tree.selection_set(items)
         return "break"
 
-    def _clear_tree_selection(self, event: Any = None) -> None:
-        if event is not None and event.widget is self.file_tree:
-            return
-        for iid in self.file_tree.selection():
-            self.file_tree.selection_remove(iid)
-
     # ------------------------------------------------------------------
-    # 右侧：处理选项 + 处理结果
+    # 文件转写：右侧选项 + 结果预览
     # ------------------------------------------------------------------
     def _build_right_panel(self, parent: tk.Frame) -> None:
         theme = self.theme
@@ -521,7 +1616,6 @@ class MainWindow:
         right.rowconfigure(0, weight=0)
         right.rowconfigure(1, weight=1)
 
-        # --- 处理选项 ---
         options_card, body = theme_module.make_card(right, theme, "处理选项")
         options_card.grid(row=0, column=0, sticky="ew")
         for column in (1, 3):
@@ -549,12 +1643,11 @@ class MainWindow:
             anchor="e",
         )
 
-        self.refine_check = ttk.Checkbutton(
+        self.refine_check = self._card_checkbutton(
             body,
-            text="启用 AI 整理（DeepSeek 润色）",
-            variable=self.refine_var,
-            command=self._on_option_changed,
-            style="Card.TCheckbutton",
+            "启用 AI 整理（DeepSeek 润色）",
+            self.refine_var,
+            self._on_option_changed,
         )
         self.refine_check.grid(
             row=0, column=0, columnspan=2, sticky="w", pady=theme.px(4)
@@ -619,12 +1712,11 @@ class MainWindow:
         for fmt in EXPORT_FORMATS:
             var = tk.BooleanVar(value=fmt in ("txt", "md"))
             self.format_vars[fmt] = var
-            check = ttk.Checkbutton(
+            check = self._card_checkbutton(
                 formats_frame,
-                text=format_labels.get(fmt, fmt),
-                variable=var,
-                command=self._on_option_changed,
-                style="Card.TCheckbutton",
+                format_labels.get(fmt, fmt),
+                var,
+                self._on_option_changed,
             )
             check.pack(side="left", padx=(0, theme.px(12)))
             self.format_checks.append(check)
@@ -642,7 +1734,6 @@ class MainWindow:
         )
         self.output_dir_var.trace_add("write", self._on_output_dir_changed)
 
-        # --- 处理结果 ---
         results_card, results_body = theme_module.make_card(right, theme, "处理结果")
         results_card.grid(row=1, column=0, sticky="nsew", pady=(theme.px(12), 0))
 
@@ -709,35 +1800,32 @@ class MainWindow:
         widget.yview_moveto(0.0)
 
     # ------------------------------------------------------------------
-    # 底部状态栏与操作按钮
+    # 全局状态栏
     # ------------------------------------------------------------------
-    def _build_bottom_bar(self, root: tk.Tk) -> None:
+    def _build_status_bar(self, root: tk.Tk) -> None:
         theme = self.theme
         colors = COLORS
         bottom = tk.Frame(root, bg=colors["bg"])
         bottom.grid(
-            row=2,
+            row=3,
             column=0,
             sticky="ew",
             padx=theme.px(16),
-            pady=(theme.px(2), theme.px(12)),
+            pady=(theme.px(4), theme.px(10)),
         )
-
-        status_row = tk.Frame(bottom, bg=colors["bg"])
-        status_row.pack(fill="x")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_bar = ttk.Progressbar(
-            status_row,
+            bottom,
             mode="determinate",
             maximum=100.0,
             variable=self.progress_var,
             style="Accent.Horizontal.TProgressbar",
-            length=theme.px(220),
+            length=theme.px(200),
         )
         self.progress_bar.pack(side="left", pady=theme.px(4))
         self.status_var = tk.StringVar(value="就绪")
         tk.Label(
-            status_row,
+            bottom,
             textvariable=self.status_var,
             bg=colors["bg"],
             fg=colors["text"],
@@ -746,7 +1834,7 @@ class MainWindow:
         ).pack(side="left", fill="x", expand=True, padx=(theme.px(12), theme.px(8)))
         self.memory_var = tk.StringVar(value="内存 --")
         tk.Label(
-            status_row,
+            bottom,
             textvariable=self.memory_var,
             bg=colors["bg"],
             fg=colors["faint"],
@@ -754,41 +1842,29 @@ class MainWindow:
             anchor="e",
         ).pack(side="right")
 
-        button_row = tk.Frame(bottom, bg=colors["bg"])
-        button_row.pack(fill="x", pady=(theme.px(8), 0))
-
-        self.start_btn = self._action_button(
-            button_row, "开始处理", self._start_processing, primary=True
-        )
-        self.start_btn.pack(side="right")
-        self.cancel_btn = self._action_button(
-            button_row, "取消", self._cancel_processing, danger=True
-        )
-        self.cancel_btn.configure(state="disabled")
-        self.cancel_btn.pack(side="right", padx=(0, theme.px(8)))
-        self.copy_btn = self._action_button(
-            button_row, "复制整理稿", self._copy_result
-        )
-        self.copy_btn.pack(side="left")
-        self.open_dir_btn = self._action_button(
-            button_row, "打开输出目录", self._open_output_dir
-        )
-        self.open_dir_btn.pack(side="left", padx=(theme.px(8), 0))
-
     def _set_status(self, message: str) -> None:
         try:
             self.status_var.set(message)
         except tk.TclError:  # pragma: no cover
             pass
 
+    # ==================================================================
+    # 快捷键
+    # ==================================================================
     def _bind_shortcuts(self) -> None:
+        self.root.bind("<F2>", self._on_f2)
+        self.root.bind("<Escape>", self._on_escape)
+        self.root.bind("<Control-Return>", self._on_home_copy_shortcut)
         self.root.bind("<Control-o>", lambda _event: self._add_files())
         self.root.bind("<Control-O>", lambda _event: self._add_files())
         self.root.bind("<F5>", lambda _event: self._start_processing())
-        self.root.bind("<Escape>", self._on_escape)
 
     def _on_escape(self, _event: Any = None) -> None:
-        if self._processing:
+        if self._quick_state == "recording":
+            self._cancel_quick_recording()
+        elif self._quick_state == "converting":
+            self._cancel_quick_conversion()
+        elif self._processing:
             self._cancel_processing()
 
     # ==================================================================
@@ -815,10 +1891,11 @@ class MainWindow:
             except Exception:  # pragma: no cover - 目录创建失败
                 default_out = ""
             self.output_dir_var.set(self.settings.output_dir.strip() or default_out)
+            self.auto_copy_var.set(bool(getattr(self.settings, "auto_copy", True)))
         finally:
             self._syncing_options = False
-        self._set_options_enabled(not self._processing)
-        self._sync_record_button()
+        self._refresh_action_states()
+        self._set_home_mode_hint()
 
     def _on_output_dir_changed(self, *_args: Any) -> None:
         if self._syncing_options:
@@ -901,10 +1978,9 @@ class MainWindow:
             self._set_status(f"保存设置失败：{_shorten(str(exc), 50)}")
 
     def _set_options_enabled(self, enabled: bool) -> None:
-        state = ["!disabled"] if enabled else ["disabled"]
         for widget in [self.refine_check, *self.format_checks]:
             try:
-                widget.state(state)
+                widget.configure(state="normal" if enabled else "disabled")
             except tk.TclError:  # pragma: no cover
                 pass
         for combo in (self.style_combo, self.language_combo, self.model_combo):
@@ -1078,7 +2154,7 @@ class MainWindow:
         self._set_status("已清空文件列表")
 
     # ==================================================================
-    # 处理流程
+    # 文件批量处理
     # ==================================================================
     def _resolve_output_dir(self) -> Optional[Path]:
         raw = self.output_dir_var.get().strip()
@@ -1111,10 +2187,17 @@ class MainWindow:
     def _start_processing(self) -> None:
         if self._processing or self._closing:
             return
+        if self._quick_state != "idle":
+            messagebox.showinfo(
+                "语音输入进行中",
+                "请先结束或取消当前录音/转换，再开始文件转写。",
+                parent=self.root,
+            )
+            return
         if not self.files:
             messagebox.showinfo(
                 "还没有文件",
-                "请先添加要处理的音频文件，或点击顶部的「● 录音」现场录制。",
+                "请先添加要处理的音频文件。也可以回到「语音输入」页直接口述转文字。",
                 parent=self.root,
             )
             return
@@ -1176,9 +2259,7 @@ class MainWindow:
         for item in pending:
             self._set_file_status(item, "等待中")
         self._set_processing_ui(True)
-        self._set_status(
-            f"开始处理 {len(pending)} 个文件 · 输出到 {out_dir}"
-        )
+        self._set_status(f"开始处理 {len(pending)} 个文件 · 输出到 {out_dir}")
 
         self._worker = threading.Thread(
             target=self._worker_main,
@@ -1200,9 +2281,7 @@ class MainWindow:
         for index, item in enumerate(files):
             if cancel.is_set():
                 for rest in files[index:]:
-                    self.ui_queue.put(
-                        ("file_status", process_id, rest, "未处理")
-                    )
+                    self.ui_queue.put(("file_status", process_id, rest, "未处理"))
                 self.ui_queue.put(("batch_done", process_id, "cancelled"))
                 return
             self.ui_queue.put(("file_index", process_id, index))
@@ -1217,9 +2296,7 @@ class MainWindow:
             except CancelledError:
                 self.ui_queue.put(("file_status", process_id, item, "已取消"))
                 for rest in files[index + 1:]:
-                    self.ui_queue.put(
-                        ("file_status", process_id, rest, "未处理")
-                    )
+                    self.ui_queue.put(("file_status", process_id, rest, "未处理"))
                 self.ui_queue.put(("batch_done", process_id, "cancelled"))
                 return
             except Exception as exc:  # 单个文件失败不影响后续文件
@@ -1237,15 +2314,8 @@ class MainWindow:
         self._set_status("正在取消…（当前阶段结束后停止）")
 
     def _set_processing_ui(self, processing: bool) -> None:
-        state = "disabled" if processing else "normal"
-        self.start_btn.configure(
-            state=state, text="处理中…" if processing else "开始处理"
-        )
-        self.cancel_btn.configure(state="normal" if processing else "disabled")
-        for button in (self.add_btn, self.remove_btn, self.clear_btn, self.settings_btn):
-            button.configure(state=state)
-        self._set_options_enabled(not processing)
-        self._sync_record_button()
+        self._processing = processing
+        self._refresh_action_states()
 
     # ------------------------------------------------------------------
     # 队列消息处理（主线程）
@@ -1294,6 +2364,22 @@ class MainWindow:
             _, process_id, outcome = message
             if process_id == self._process_id:
                 self._on_batch_done(outcome)
+        elif kind == "quick_event":
+            _, seq, event = message
+            if seq == self._quick_seq:
+                self._on_quick_event(event)
+        elif kind == "quick_done":
+            _, seq, result = message
+            if seq == self._quick_seq:
+                self._on_quick_done(result)
+        elif kind == "quick_cancelled":
+            _, seq, _payload = message
+            if seq == self._quick_seq:
+                self._on_quick_cancelled()
+        elif kind == "quick_error":
+            _, seq, exc = message
+            if seq == self._quick_seq:
+                self._on_quick_error(exc)
 
     def _overall_percent(self, stage: str, ratio: Optional[float]) -> float:
         start, end = _STAGE_WEIGHTS.get(stage, (0.0, 100.0))
@@ -1387,7 +2473,7 @@ class MainWindow:
             self._set_status(summary)
 
     # ------------------------------------------------------------------
-    # 结果预览与操作
+    # 文件结果预览与操作
     # ------------------------------------------------------------------
     def _show_result(self, item: QueueFile, result: JobResult) -> None:
         raw_text = result.transcript.with_timestamps().strip() or result.transcript.text.strip()
@@ -1465,163 +2551,42 @@ class MainWindow:
             )
 
     # ==================================================================
-    # 录音
+    # 录音设备初始化
     # ==================================================================
     def _init_recorder(self) -> None:
         self._recorder = None
         self._recorder_note = ""
         if not _RECORDER_IMPORT_OK or Recorder is None:
-            self._sync_record_button()
+            self._refresh_action_states()
             return
         try:
             recorder = Recorder(recordings_dir=recordings_dir())
             available = bool(recorder.available())
         except NotImplementedError:
-            log.debug("录音模块尚未实现，录音按钮暂不可用")
-            self._sync_record_button()
+            log.debug("录音模块尚未实现，语音输入暂不可用")
+            self._refresh_action_states()
             return
         except Exception as exc:
             log.info("录音初始化失败：%s", exc)
             self._recorder_note = f"录音不可用：{_shorten(str(exc), 40)}"
-            self._sync_record_button()
+            self._refresh_action_states()
             return
         if not available:
             self._recorder_note = "未检测到可用的麦克风，录音按钮已禁用"
-            self._sync_record_button()
+            self._refresh_action_states()
             return
         self._recorder = recorder
-        self._sync_record_button()
-
-    def _sync_record_button(self) -> None:
-        try:
-            if self._recorder is None or self._processing:
-                self.record_btn.configure(
-                    state="disabled",
-                    text="● 录音",
-                    bg=COLORS["header"],
-                    fg=COLORS["header_sub"],
-                )
-            elif self._recording:
-                elapsed = self._recording_elapsed()
-                self.record_btn.configure(
-                    state="normal",
-                    text=f"■ 停止录音 {format_timestamp(elapsed)}",
-                    bg="#a33737",
-                    fg="#ffffff",
-                )
-            else:
-                self.record_btn.configure(
-                    state="normal",
-                    text="● 录音",
-                    bg=COLORS["header"],
-                    fg="#f7b0b0",
-                )
-        except tk.TclError:  # pragma: no cover
-            pass
-
-    def _recording_elapsed(self) -> float:
-        try:
-            if self._recorder is not None:
-                return max(0.0, float(self._recorder.elapsed_seconds))
-        except Exception:  # pragma: no cover - 录音器状态不可用
-            pass
-        return max(0.0, time.monotonic() - self._record_started)
-
-    def _toggle_recording(self) -> None:
-        if self._processing:
-            return
-        if self._recorder is None:
-            messagebox.showinfo(
-                "录音不可用",
-                self._recorder_note
-                or "未检测到可用的麦克风。请检查系统麦克风设备后重新打开程序。",
-                parent=self.root,
-            )
-            return
-        if self._recording:
-            self._stop_recording()
-        else:
-            self._start_recording()
-
-    def _start_recording(self) -> None:
-        try:
-            self._recorder.start()
-        except NotImplementedError:
-            messagebox.showinfo(
-                "录音暂不可用", "录音模块尚未完成，请稍后再试。", parent=self.root
-            )
-            return
-        except VoxError as exc:
-            detail = str(exc)
-            if exc.user_hint:
-                detail += f"\n\n提示：{exc.user_hint}"
-            messagebox.showerror("无法开始录音", detail, parent=self.root)
-            return
-        except Exception as exc:  # pragma: no cover - 设备级异常
-            log.exception("启动录音失败")
-            messagebox.showerror(
-                "无法开始录音",
-                f"启动录音失败：{exc}\n\n请检查麦克风是否被其他程序占用。",
-                parent=self.root,
-            )
-            return
-        self._recording = True
-        self._record_started = time.monotonic()
-        self._sync_record_button()
-        self._set_status("录音中… 再次点击「■ 停止录音」结束并加入待处理列表")
-        self._tick_recording()
-
-    def _tick_recording(self) -> None:
-        self._record_job = None
-        if not self._recording or self._closing:
-            return
-        elapsed = self._recording_elapsed()
-        self._sync_record_button()
-        self._set_status(
-            f"录音中 {format_timestamp(elapsed)} · 点击「■ 停止录音」结束并加入列表"
-        )
-        try:
-            self._record_job = self.root.after(500, self._tick_recording)
-        except tk.TclError:  # pragma: no cover
-            pass
-
-    def _stop_recording(self) -> None:
-        self._recording = False
-        if self._record_job is not None:
-            try:
-                self.root.after_cancel(self._record_job)
-            except Exception:  # pragma: no cover
-                pass
-            self._record_job = None
-        saved_path: Optional[Path] = None
-        try:
-            if self._recorder is not None:
-                saved_path = self._recorder.stop()
-        except NotImplementedError:
-            saved_path = None
-        except Exception as exc:  # pragma: no cover - 设备级异常
-            log.exception("保存录音失败")
-            self._sync_record_button()
-            messagebox.showerror(
-                "录音保存失败", f"无法保存录音：{exc}", parent=self.root
-            )
-            self._set_status("录音保存失败")
-            return
-        self._sync_record_button()
-        if saved_path is None:
-            self._set_status("录音已取消")
-            return
-        path = Path(saved_path)
-        self._add_paths([str(path)])
-        self._set_status(f"录音已保存并加入列表：{path.name}")
+        self._refresh_action_states()
 
     # ==================================================================
     # 设置 / 帮助 / 首次引导
     # ==================================================================
     def _open_settings(self) -> None:
-        if self._processing:
+        if self._processing or self._quick_state != "idle":
             messagebox.showinfo(
-                "请稍候", "正在处理文件，请等待完成后再修改设置。", parent=self.root
+                "请稍候",
+                "正在处理任务，请等待完成或取消后再修改设置。",
+                parent=self.root,
             )
             return
         dialog = SettingsDialog(
@@ -1663,10 +2628,9 @@ class MainWindow:
         if choice == "settings":
             self._open_settings()
         elif choice == "transcribe":
-            if self.refine_var.get():
-                self.refine_var.set(False)
-                self._on_option_changed()
-            self._set_status("已切换为「只做本地转写」，随时可在「设置」中填写 API Key")
+            self._set_status(
+                "已选择本地转写体验，随时可在「设置」中填写 DeepSeek Key 启用 AI 整理"
+            )
 
     @staticmethod
     def _model_size_hint(model_key: str) -> str:
@@ -1748,6 +2712,20 @@ class MainWindow:
     def _on_close(self) -> None:
         if self._closing:
             return
+        if self._quick_state == "recording":
+            if not messagebox.askyesno(
+                "正在录音",
+                "正在录音，确定要退出吗？\n本次录音将被丢弃。",
+                parent=self.root,
+            ):
+                return
+        if self._quick_state == "converting":
+            if not messagebox.askyesno(
+                "正在转换",
+                "正在把语音转换成文字，确定要退出吗？\n本次转换将被中断。",
+                parent=self.root,
+            ):
+                return
         if self._processing:
             if not messagebox.askyesno(
                 "正在处理",
@@ -1755,17 +2733,19 @@ class MainWindow:
                 parent=self.root,
             ):
                 return
-        if self._recording:
-            if not messagebox.askyesno(
-                "正在录音",
-                "正在录音，确定要退出吗？\n本次录音将被丢弃。",
-                parent=self.root,
-            ):
-                return
+
         self._closing = True
+        self._quick_cancel.set()
         self._cancel_event.set()
 
-        for attribute in ("_poll_job", "_memory_job", "_idle_job", "_save_job", "_record_job"):
+        for attribute in (
+            "_poll_job",
+            "_memory_job",
+            "_idle_job",
+            "_save_job",
+            "_wave_job",
+            "_autoclose_job",
+        ):
             job = getattr(self, attribute, None)
             if job is not None:
                 try:
@@ -1773,16 +2753,22 @@ class MainWindow:
                 except Exception:  # pragma: no cover
                     pass
                 setattr(self, attribute, None)
+        for job in self._startup_jobs:
+            try:
+                self.root.after_cancel(job)
+            except Exception:  # pragma: no cover
+                pass
+        self._startup_jobs = []
 
+        try:
+            if self._recorder is not None and self._quick_state == "recording":
+                self._recorder.cancel()
+        except Exception:  # pragma: no cover
+            log.warning("退出时取消录音失败", exc_info=True)
         try:
             self.pipeline.unload()
         except Exception:  # pragma: no cover - 卸载失败不应阻止退出
             log.warning("退出时卸载模型失败", exc_info=True)
-        try:
-            if self._recorder is not None and self._recording:
-                self._recorder.cancel()
-        except Exception:  # pragma: no cover
-            log.warning("退出时取消录音失败", exc_info=True)
 
         try:
             self.settings.window_geometry = self.root.wm_geometry()
@@ -1805,17 +2791,28 @@ class MainWindow:
 # 启动入口
 # ======================================================================
 def _create_root() -> tk.Tk:
-    """优先创建支持拖拽的 Tk 根窗口；失败则降级为普通 Tk。"""
+    """优先创建支持拖拽的 Tk 根窗口；失败则降级为普通 Tk。
+
+    测试/自动化场景下设置环境变量 ``VOXSCRIBE_GUI_HIDDEN=1``，
+    创建的根窗口会立即隐藏，避免在用户桌面上弹出调试窗口。
+    """
     global _DND_AVAILABLE
+    root: Optional[tk.Tk] = None
     if _DND_IMPORT_OK and TkinterDnD is not None:
         try:
             root = TkinterDnD.Tk()  # type: ignore[misc]
             _DND_AVAILABLE = True
-            return root
         except Exception:  # pragma: no cover - 取决于 tkdnd 环境
             log.warning("tkinterdnd2 初始化失败，将不支持拖拽添加文件", exc_info=True)
-    _DND_AVAILABLE = False
-    return tk.Tk()
+    if root is None:
+        _DND_AVAILABLE = False
+        root = tk.Tk()
+    if os.environ.get("VOXSCRIBE_GUI_HIDDEN", "").strip() == "1":
+        try:
+            root.withdraw()
+        except tk.TclError:  # pragma: no cover
+            pass
+    return root
 
 
 def launch() -> int:

@@ -168,6 +168,33 @@ def test_run_with_refine(tmp_path: Path, fake_export) -> None:
     assert refiner.last_options.style == "meeting"
 
 
+def test_transcribe_and_refine_without_export(tmp_path: Path, monkeypatch) -> None:
+    """快速语音输入入口：只转写+整理，不写文件。"""
+    settings = _settings(tmp_path)
+    asr = FakeASR()
+    refiner = FakeRefiner()
+    pipe = _make_pipeline(settings, asr, refiner)
+    export_calls = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "export_result",
+        lambda *args, **kwargs: export_calls.append(1) or [],
+    )
+    events, emit = _collect()
+
+    result = pipe.transcribe_and_refine(
+        _audio(tmp_path), JobOptions(refine=True, style="proofread"), emit
+    )
+
+    assert export_calls == []
+    assert result.output_files == []
+    assert result.final_text == "我们讨论一下项目进度。"
+    assert result.elapsed >= 0
+    assert events[-1].stage == "done"
+    assert "转换完成" in events[-1].message
+    assert pipe.busy is False
+
+
 def test_missing_api_key_raises(tmp_path: Path, fake_export, monkeypatch) -> None:
     monkeypatch.delenv("VOXSCRIBE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)

@@ -1,11 +1,13 @@
-"""任务流水线：语音转写 -> DeepSeek 整理 -> 导出文件。
+"""任务流水线：语音转写 -> DeepSeek 整理 ->（可选）导出文件。
 
 设计要点：
 * 所有耗时操作都在调用方（GUI 工作线程）中同步执行，本模块不创建线程；
 * 通过 ``emit(JobEvent)`` 回报进度，由界面线程换算成进度条；
 * 取消使用 ``threading.Event``，在阶段边界与模块内部检查；
-* ASR 模型懒加载并复用；空闲时可由 GUI 调用 :meth:`maybe_unload_idle`
-  主动卸载，保证「轻量」。
+* ASR 模型懒加载并复用；空闲时可调用 :meth:`maybe_unload_idle`
+  主动卸载，保证「轻量」；
+* :meth:`Pipeline.run` 用于文件转写（转写 + 整理 + 导出）；
+  :meth:`Pipeline.transcribe_and_refine` 用于快速语音输入（不写文件）。
 """
 
 from __future__ import annotations
@@ -134,17 +136,11 @@ class Pipeline:
         self._asr_signature = None
 
     # ------------------------------------------------------------------
-    # 主流程
+    # 校验与阶段执行
     # ------------------------------------------------------------------
-    def run(
-        self,
-        audio_path: str | Path,
-        job: JobOptions,
-        emit: Emit,
-        cancel: Optional[threading.Event] = None,
-    ) -> JobResult:
-        """处理单个音频文件；异常交由调用方捕获并转换为界面状态。"""
-        cancel = cancel or threading.Event()
+    def _prepare_audio(
+        self, audio_path: str | Path, emit: Emit, cancel: threading.Event
+    ) -> Path:
         audio = Path(audio_path)
         emit(
             JobEvent(
@@ -165,94 +161,119 @@ class Pipeline:
             raise errors.AudioError(f"无法读取音频文件：{audio.name}（{exc}）") from exc
         if cancel.is_set():
             raise errors.CancelledError("任务已取消")
+        return audio
 
-        self._busy = True
-        started = time.monotonic()
-        try:
-            # ---------- 1. 语音转写 ----------
-            asr = self._get_asr()
+    def _transcribe_and_refine(
+        self,
+        audio: Path,
+        job: JobOptions,
+        emit: Emit,
+        cancel: threading.Event,
+    ) -> JobResult:
+        """阶段 1+2：本地转写 + DeepSeek 整理，返回未导出的结果。"""
+        # ---------- 1. 语音转写 ----------
+        asr = self._get_asr()
+        emit(
+            JobEvent(
+                stage="asr",
+                progress=0.0,
+                message=f"语音转写中（模型 {self.settings.asr_model}，"
+                f"{self.settings.effective_threads()} 线程）…",
+                audio_path=str(audio),
+            )
+        )
+
+        def on_asr_progress(ratio: float, message: str) -> None:
+            if cancel.is_set():
+                raise errors.CancelledError("任务已取消")
             emit(
                 JobEvent(
                     stage="asr",
-                    progress=0.0,
-                    message=f"语音转写中（模型 {self.settings.asr_model}，"
-                    f"{self.settings.effective_threads()} 线程）…",
+                    progress=max(0.0, min(1.0, float(ratio))),
+                    message=message or "语音转写中…",
                     audio_path=str(audio),
                 )
             )
 
-            def on_asr_progress(ratio: float, message: str) -> None:
+        transcript = asr.transcribe(
+            audio,
+            language=None if job.language in (None, "", "auto") else job.language,
+            on_progress=on_asr_progress,
+            cancel=cancel,
+        )
+        if transcript.is_empty:
+            raise errors.ASRError(
+                "没有识别到有效语音内容",
+                hint="请确认音频中有清晰的人声，或换用更大的识别模型（设置 → 识别模型）。",
+            )
+        if cancel.is_set():
+            raise errors.CancelledError("任务已取消")
+
+        # ---------- 2. DeepSeek 整理 ----------
+        refined: Optional[RefineResult] = None
+        if job.refine:
+            emit(
+                JobEvent(
+                    stage="refine",
+                    progress=0.0,
+                    message="DeepSeek 正在整理文字…",
+                    audio_path=str(audio),
+                )
+            )
+            options = RefineOptions(
+                enabled=True,
+                style=job.style or self.settings.default_style,
+                language=(
+                    job.language
+                    if job.language not in (None, "", "auto")
+                    else (transcript.language or "zh")
+                ),
+                glossary=self.settings.glossary,
+            )
+
+            def on_refine_progress(ratio: float, message: str) -> None:
                 if cancel.is_set():
                     raise errors.CancelledError("任务已取消")
                 emit(
                     JobEvent(
-                        stage="asr",
-                        progress=max(0.0, min(1.0, float(ratio))),
-                        message=message or "语音转写中…",
-                        audio_path=str(audio),
-                    )
-                )
-
-            transcript = asr.transcribe(
-                audio,
-                language=None if job.language in (None, "", "auto") else job.language,
-                on_progress=on_asr_progress,
-                cancel=cancel,
-            )
-            if transcript.is_empty:
-                raise errors.ASRError(
-                    "没有识别到有效语音内容",
-                    hint="请确认音频中有清晰的人声，或换用更大的识别模型（设置 → 识别模型）。",
-                )
-            if cancel.is_set():
-                raise errors.CancelledError("任务已取消")
-
-            # ---------- 2. DeepSeek 整理 ----------
-            refined: Optional[RefineResult] = None
-            if job.refine:
-                emit(
-                    JobEvent(
                         stage="refine",
-                        progress=0.0,
-                        message="DeepSeek 正在整理文字…",
+                        progress=max(0.0, min(1.0, float(ratio))),
+                        message=message or "DeepSeek 正在整理文字…",
                         audio_path=str(audio),
                     )
                 )
-                options = RefineOptions(
-                    enabled=True,
-                    style=job.style or self.settings.default_style,
-                    language=(
-                        job.language
-                        if job.language not in (None, "", "auto")
-                        else (transcript.language or "zh")
-                    ),
-                    glossary=self.settings.glossary,
-                )
 
-                def on_refine_progress(ratio: float, message: str) -> None:
-                    if cancel.is_set():
-                        raise errors.CancelledError("任务已取消")
-                    emit(
-                        JobEvent(
-                            stage="refine",
-                            progress=max(0.0, min(1.0, float(ratio))),
-                            message=message or "DeepSeek 正在整理文字…",
-                            audio_path=str(audio),
-                        )
-                    )
-
-                refined = self._get_refiner().refine(
-                    transcript, options, on_progress=on_refine_progress, cancel=cancel
+            refined = self._get_refiner().refine(
+                transcript, options, on_progress=on_refine_progress, cancel=cancel
+            )
+            if not (refined.text or "").strip():
+                raise errors.RefineError(
+                    "DeepSeek 返回了空结果",
+                    hint="可以关闭「AI 整理」后重试，或稍后再试。",
                 )
-                if not (refined.text or "").strip():
-                    raise errors.RefineError(
-                        "DeepSeek 返回了空结果",
-                        hint="可以关闭「AI 整理」后重试，或稍后再试。",
-                    )
             if cancel.is_set():
                 raise errors.CancelledError("任务已取消")
 
-            # ---------- 3. 导出 ----------
+        return JobResult(audio_path=str(audio), transcript=transcript, refined=refined)
+
+    # ------------------------------------------------------------------
+    # 公共入口
+    # ------------------------------------------------------------------
+    def run(
+        self,
+        audio_path: str | Path,
+        job: JobOptions,
+        emit: Emit,
+        cancel: Optional[threading.Event] = None,
+    ) -> JobResult:
+        """文件转写：转写 + 整理 + 导出文件；异常交由调用方捕获。"""
+        cancel = cancel or threading.Event()
+        audio = self._prepare_audio(audio_path, emit, cancel)
+        self._busy = True
+        started = time.monotonic()
+        try:
+            result = self._transcribe_and_refine(audio, job, emit, cancel)
+
             emit(
                 JobEvent(
                     stage="export",
@@ -260,9 +281,6 @@ class Pipeline:
                     message="写出结果文件…",
                     audio_path=str(audio),
                 )
-            )
-            result = JobResult(
-                audio_path=str(audio), transcript=transcript, refined=refined
             )
             out_dir = (
                 Path(job.output_dir) if job.output_dir else self.settings.resolve_output_dir()
@@ -284,6 +302,35 @@ class Pipeline:
                     stage="done",
                     progress=1.0,
                     message=f"完成，用时 {human_duration(result.elapsed)}",
+                    audio_path=str(audio),
+                    result=result,
+                )
+            )
+            return result
+        finally:
+            self._last_activity = time.monotonic()
+            self._busy = False
+
+    def transcribe_and_refine(
+        self,
+        audio_path: str | Path,
+        job: JobOptions,
+        emit: Emit,
+        cancel: Optional[threading.Event] = None,
+    ) -> JobResult:
+        """快速语音输入：转写 + 整理，不写任何文件（结果直接交给界面）。"""
+        cancel = cancel or threading.Event()
+        audio = self._prepare_audio(audio_path, emit, cancel)
+        self._busy = True
+        started = time.monotonic()
+        try:
+            result = self._transcribe_and_refine(audio, job, emit, cancel)
+            result.elapsed = time.monotonic() - started
+            emit(
+                JobEvent(
+                    stage="done",
+                    progress=1.0,
+                    message=f"转换完成，用时 {human_duration(result.elapsed)}",
                     audio_path=str(audio),
                     result=result,
                 )

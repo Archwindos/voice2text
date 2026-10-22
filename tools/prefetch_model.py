@@ -37,6 +37,18 @@ def main() -> int:
     model_dir = Path(args.model_dir) if args.model_dir else settings.resolve_model_dir()
     model_dir.mkdir(parents=True, exist_ok=True)
     print(f"模型目录：{model_dir}")
+
+    # 先查本地缓存，避免重复联网下载（也兼容手动放入的模型文件）
+    try:
+        from voxscribe.asr import WhisperASR  # noqa: PLC0415
+
+        probe = WhisperASR(model_size=args.model, model_dir=str(model_dir))
+        if probe.is_model_available():
+            print(f"模型 {args.model} 已缓存，无需重复下载（{probe.model_size_hint()}）")
+            return 0
+    except Exception as exc:  # 缓存探测失败不影响后续下载
+        print(f"缓存探测跳过：{exc}")
+
     print(f"正在下载/校验模型 {args.model} …")
     try:
         from faster_whisper import WhisperModel

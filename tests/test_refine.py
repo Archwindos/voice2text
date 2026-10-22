@@ -208,6 +208,10 @@ def test_fixed_response(server, sample_transcript):
 
 
 def test_all_styles_use_their_system_prompt(server, sample_transcript):
+    # v1.1 起共 5 种风格（新增「口述校对」），prompt 表必须与 models.STYLES 同步
+    assert set(STYLES) == {"oral", "proofread", "meeting", "verbatim", "summary"}
+    assert "proofread" in STYLES
+    assert len(prompts.STYLE_PROMPTS) == 5
     assert set(prompts.STYLE_PROMPTS) == set(STYLES)
     for style in STYLES:
         client = make_refiner(server)
@@ -219,6 +223,70 @@ def test_all_styles_use_their_system_prompt(server, sample_transcript):
         assert system_content(server.last_request.json) == prompts.system_prompt(
             style, "zh"
         )
+
+
+def test_proofread_style_prompt_and_result(server, refiner, sample_transcript):
+    """「口述校对」：system prompt 强调上下文纠错/错别字/术语表，结果与 usage 正常。"""
+    result, progress = run_refine(
+        refiner, sample_transcript, RefineOptions(style="proofread")
+    )
+
+    payload = server.last_request.json
+    system = system_content(payload)
+    for keyword in (
+        "校对",
+        "错别字",
+        "同音字",
+        "上下文",
+        "明显识别错误",
+        "术语表",
+        "口头禅",
+    ):
+        assert keyword in system, f"proofread system prompt 缺少关键词：{keyword}"
+    # 整词/整句误识别示例：以下→一下、在确认→再确认
+    assert "讨论以下项目" in system and "讨论一下项目" in system
+    assert "在确认" in system and "再确认" in system
+    # 拿不准时保留原文，不猜改
+    assert "不要猜" in system or "拿不准" in system
+    assert "输出语言：简体中文" in system
+    assert system == prompts.system_prompt("proofread", "zh")
+
+    # 待整理正文照常传入，结果正常返回
+    assert extract_body(last_user_content(payload)) == sample_transcript.text
+    assert result.text == sample_transcript.text
+    assert result.chunks == 1
+    assert result.usage.prompt_tokens == DEFAULT_USAGE["prompt_tokens"]
+    assert result.usage.completion_tokens == DEFAULT_USAGE["completion_tokens"]
+    assert result.usage.total_tokens == DEFAULT_USAGE["total_tokens"]
+    assert result.elapsed >= 0.0
+    assert progress[-1][0] == 1.0
+
+
+def test_proofread_whole_word_guidance_only_for_proofread():
+    """「结合上下文纠正整词/整句误识别」的要求只加在 proofread，不影响其他风格。"""
+    proofread = prompts.system_prompt("proofread", "zh")
+    assert "上下文" in proofread
+    assert "明显识别错误" in proofread
+    assert "讨论以下项目" in proofread
+    assert "讨论一下项目" in proofread
+    for style in ("oral", "meeting", "verbatim", "summary"):
+        system = prompts.system_prompt(style, "zh")
+        assert "讨论以下项目" not in system
+        assert "明显识别错误" not in system
+
+
+def test_proofread_style_with_glossary(server, refiner, sample_transcript):
+    options = RefineOptions(
+        style="proofread",
+        glossary="VoxScribe（语声成文）：项目名称\nDeepSeek：模型服务商",
+    )
+    run_refine(refiner, sample_transcript, options)
+    user_content = last_user_content(server.last_request.json)
+    assert prompts.GLOSSARY_MARKER in user_content
+    assert "VoxScribe（语声成文）" in user_content
+    assert "DeepSeek" in user_content
+    # 术语表优先级最高的要求写在 proofread 的 system prompt 里
+    assert "术语表" in system_content(server.last_request.json)
 
 
 def test_unknown_style_falls_back_to_oral(server, refiner, sample_transcript):

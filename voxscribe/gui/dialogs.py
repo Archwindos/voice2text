@@ -156,12 +156,14 @@ class SettingsDialog(tk.Toplevel):
         self.api_show_var = tk.BooleanVar(value=False)
         self.base_url_var = tk.StringVar()
         self.api_model_var = tk.StringVar()
+        self.key_state_var = tk.StringVar(value="")
+        self._has_saved_key = False
 
         _card_label(deepseek_body, theme, "API Key").grid(
             row=0, column=0, sticky="w", padx=(0, theme.px(10)), pady=theme.px(4)
         )
         self.api_key_entry = ttk.Entry(
-            deepseek_body, textvariable=self.api_key_var, show="●", width=32
+            deepseek_body, textvariable=self.api_key_var, show="●", width=30
         )
         self.api_key_entry.grid(row=0, column=1, sticky="ew", pady=theme.px(4))
         ttk.Checkbutton(
@@ -172,21 +174,41 @@ class SettingsDialog(tk.Toplevel):
             style="Card.TCheckbutton",
         ).grid(row=0, column=2, sticky="w", padx=(theme.px(8), 0), pady=theme.px(4))
 
+        self.key_state_label = tk.Label(
+            deepseek_body,
+            textvariable=self.key_state_var,
+            bg=COLORS["card"],
+            fg=COLORS["muted"],
+            font=theme.font(SMALL_SIZE),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(400),
+        )
+        self.key_state_label.grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(theme.px(2), theme.px(2))
+        )
+        self.clear_key_button = ttk.Button(
+            deepseek_body, text="清除已保存 Key", command=self._on_clear_api_key
+        )
+        self.clear_key_button.grid(
+            row=1, column=2, sticky="e", pady=(theme.px(2), theme.px(2))
+        )
+
         _card_label(deepseek_body, theme, "Base URL").grid(
-            row=1, column=0, sticky="w", padx=(0, theme.px(10)), pady=theme.px(4)
+            row=2, column=0, sticky="w", padx=(0, theme.px(10)), pady=theme.px(4)
         )
         ttk.Entry(deepseek_body, textvariable=self.base_url_var).grid(
-            row=1, column=1, columnspan=2, sticky="ew", pady=theme.px(4)
+            row=2, column=1, columnspan=2, sticky="ew", pady=theme.px(4)
         )
 
         _card_label(deepseek_body, theme, "模型名").grid(
-            row=2, column=0, sticky="w", padx=(0, theme.px(10)), pady=theme.px(4)
+            row=3, column=0, sticky="w", padx=(0, theme.px(10)), pady=theme.px(4)
         )
         ttk.Entry(deepseek_body, textvariable=self.api_model_var).grid(
-            row=2, column=1, sticky="ew", pady=theme.px(4)
+            row=3, column=1, sticky="ew", pady=theme.px(4)
         )
         _card_label(deepseek_body, theme, "默认 deepseek-chat", muted=True).grid(
-            row=2, column=2, sticky="w", padx=(theme.px(8), 0)
+            row=3, column=2, sticky="w", padx=(theme.px(8), 0)
         )
 
         hint = (
@@ -196,11 +218,11 @@ class SettingsDialog(tk.Toplevel):
         _card_label(
             deepseek_body, theme, hint, muted=True, wraplength=theme.px(500)
         ).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(theme.px(6), 0)
+            row=4, column=0, columnspan=3, sticky="w", pady=(theme.px(6), 0)
         )
 
         link_row = tk.Frame(deepseek_body, bg=COLORS["card"])
-        link_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(theme.px(6), 0))
+        link_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(theme.px(6), 0))
         link = tk.Label(
             link_row,
             text="去 platform.deepseek.com 申请 API Key →",
@@ -321,7 +343,10 @@ class SettingsDialog(tk.Toplevel):
     # -- 取值 ---------------------------------------------------------
     def _load_values(self) -> None:
         settings = self.settings
-        self.api_key_var.set(settings.get_api_key())
+        # 安全策略：不在界面回显已保存的 Key；留空保存 = 保持原 Key 不变。
+        self._has_saved_key = bool(settings.has_api_key)
+        self.api_key_var.set("")
+        self._update_key_state()
         self.base_url_var.set(settings.api_base_url or "https://api.deepseek.com")
         self.api_model_var.set(settings.api_model or "deepseek-chat")
         self.threads_var.set(str(int(settings.cpu_threads or 0)))
@@ -334,6 +359,48 @@ class SettingsDialog(tk.Toplevel):
         if settings.glossary:
             self.glossary_text.delete("1.0", "end")
             self.glossary_text.insert("1.0", settings.glossary)
+
+    def _update_key_state(self) -> None:
+        try:
+            if self._has_saved_key:
+                self.key_state_var.set(
+                    "已保存 API Key：●●●●●●●●（留空表示不修改；如需更换，直接输入新 Key）"
+                )
+                self.key_state_label.configure(fg=COLORS["muted"])
+                self.clear_key_button.configure(state="normal")
+            else:
+                self.key_state_var.set(
+                    "尚未配置 API Key（本地转写不需要 Key；AI 整理需要）"
+                )
+                self.key_state_label.configure(fg=COLORS["faint"])
+                self.clear_key_button.configure(state="disabled")
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _on_clear_api_key(self) -> None:
+        if not self._has_saved_key:
+            return
+        if not messagebox.askyesno(
+            "清除 API Key",
+            "确定要清除本机保存的 DeepSeek API Key 吗？\n\n"
+            "清除后语音输入将退化为仅本地转写，可随时重新填写。",
+            parent=self,
+        ):
+            return
+        self.settings.set_api_key("")
+        self._has_saved_key = False
+        self.api_key_var.set("")
+        try:
+            self.settings.save()
+            self.pipeline.apply_settings(self.settings)
+        except Exception as exc:  # pragma: no cover - 磁盘异常
+            log.exception("清除 API Key 后保存配置失败")
+            messagebox.showwarning(
+                "已清除但保存失败",
+                f"API Key 已从当前设置中清除，但写入配置文件失败：\n{exc}",
+                parent=self,
+            )
+        self._update_key_state()
 
     def _toggle_key_visible(self) -> None:
         self.api_key_entry.configure(show="" if self.api_show_var.get() else "●")
@@ -352,7 +419,12 @@ class SettingsDialog(tk.Toplevel):
     def _on_test_connection(self) -> None:
         if self._test_running:
             return
-        api_key = self.api_key_var.get().strip()
+        entered_key = self.api_key_var.get().strip()
+        api_key = entered_key
+        if not api_key and self._has_saved_key:
+            api_key = (self.settings.get_api_key() or "").strip()
+            if api_key:
+                self.key_state_var.set("正在使用已保存的 API Key 测试连接…")
         if not api_key:
             messagebox.showwarning(
                 "缺少 API Key",
@@ -406,6 +478,7 @@ class SettingsDialog(tk.Toplevel):
             return
         self._test_running = False
         self.test_button.configure(state="normal", text="测试连接")
+        self._update_key_state()
         kind = result[0]
         if kind == "ok":
             reply = (result[1] or "").strip()
@@ -467,8 +540,15 @@ class SettingsDialog(tk.Toplevel):
                 )
                 return
 
-        api_key = self.api_key_var.get().strip()
-        encrypted = self.settings.set_api_key(api_key)
+        entered_key = self.api_key_var.get().strip()
+        encrypted = True
+        if entered_key:
+            encrypted = self.settings.set_api_key(entered_key)
+            self._has_saved_key = bool(self.settings.has_api_key)
+        elif not self._has_saved_key:
+            # 从未配置过 Key：保持空，不影响本地转写
+            self.settings.set_api_key("")
+        # 留空且已有 Key：保持已保存的 Key 不变（显式清除请点「清除已保存 Key」）
         self.settings.api_base_url = base_url
         self.settings.api_model = model
         self.settings.cpu_threads = threads
@@ -488,7 +568,7 @@ class SettingsDialog(tk.Toplevel):
             )
             return
 
-        if api_key and not encrypted:
+        if entered_key and not encrypted:
             messagebox.showwarning(
                 "提示",
                 "当前系统不支持 DPAPI 加密，API Key 将以受限明文形式保存在本机配置文件中。",
@@ -560,7 +640,7 @@ class WelcomeDialog(tk.Toplevel):
         ).pack(fill="x")
         tk.Label(
             outer,
-            text="VoxScribe · 把语音内容整理成书面文字",
+            text="VoxScribe · 说出来，就是文字",
             bg=COLORS["card"],
             fg=COLORS["muted"],
             font=theme.font(SMALL_SIZE),
@@ -570,9 +650,18 @@ class WelcomeDialog(tk.Toplevel):
         tk.Frame(outer, bg=COLORS["border"], height=1).pack(fill="x", pady=(0, theme.px(14)))
 
         bullets = [
-            ("本地转写，免费且离线", "语音识别在你自己的电脑上完成，音频不会上传，也不需要任何费用。"),
-            ("AI 整理，需要 DeepSeek Key", "在 platform.deepseek.com 申请 API Key 后，可把口语整理成通顺的书面文字（按量付费，费用很低）。"),
-            ("导出多种格式", "处理完成后自动导出 txt / md / docx / srt，保存在 outputs/ 目录。"),
+            (
+                "点一下，说话就变成文字",
+                "点大按钮或按 F2 开始说话，再按一次结束；几秒后自动得到整理好的文字，不用打字。",
+            ),
+            (
+                "本地转写 + DeepSeek 纠错",
+                "语音在本机转写、音频不上传；配置 DeepSeek Key 后自动纠正错别字、去口头禅、补标点。",
+            ),
+            (
+                "可修改、一键复制",
+                "结果直接显示在首页下方，可以随手修改并一键复制；已保存的音频也可以用「文件转写」批量处理。",
+            ),
         ]
         for title, detail in bullets:
             row = tk.Frame(outer, bg=COLORS["card"])
@@ -606,7 +695,8 @@ class WelcomeDialog(tk.Toplevel):
             ).pack(fill="x")
 
         note = (
-            "还没有 API Key？现在可以先只做语音转写，稍后在「设置」中随时补充。"
+            "还没有 API Key？可以先体验本地转写：按 F2 说一段，文字会直接出现在首页；"
+            "稍后在「设置」中补充 Key 即可启用 AI 纠错整理。"
         )
         tk.Label(
             outer,
@@ -624,7 +714,7 @@ class WelcomeDialog(tk.Toplevel):
         buttons = tk.Frame(outer, bg=COLORS["card"])
         buttons.pack(fill="x", pady=(theme.px(18), 0))
         _dialog_button(
-            buttons, theme, "先只转写", self._choose_transcribe, width_chars=10
+            buttons, theme, "先体验本地转写", self._choose_transcribe, width_chars=14
         ).pack(side="right", padx=(theme.px(8), 0))
         _dialog_button(
             buttons, theme, "去配置 API Key", self._choose_settings, primary=True,
@@ -666,38 +756,42 @@ class WelcomeDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 # 帮助
 # ---------------------------------------------------------------------------
-_HELP_TEXT = """三步完成转写
+_HELP_TEXT = """语音输入：说一句，立刻成文（推荐）
 
-1. 添加音频
-   点击「添加文件」选择 mp3 / wav / m4a / flac 等音频，也可以直接把文件拖进左侧列表。
-   需要现场录制时，点击顶部的「● 录音」，再点一次「■ 停止录音」，
-   录音会自动加入待处理列表。
+1. 开始说话
+   点击首页的大按钮「● 开始录音」，或直接按 F2，对着麦克风正常说话。
+   录音时波形会实时跳动，顶部显示录音时长，说明麦克风工作正常。
 
-2. 设置处理选项
-   选择整理风格（口述成文 / 会议纪要 / 逐字稿润色 / 要点摘要）、音频语言、
-   识别模型和要导出的格式，并确认输出目录。
-   默认导出到程序目录下的 outputs/ 文件夹。
+2. 再按一次结束
+   说完后再按一次 F2（或点击「■ 停止并转换」）。
+   程序会自动：本地语音转写 → DeepSeek「口述校对」（纠错别字、去口头禅、补标点）。
 
-3. 开始处理
-   点击「开始处理」，程序会依次完成：本地语音转写 → DeepSeek 整理 → 导出文件。
-   处理过程可以随时点击「取消」；完成后可用「复制整理稿」「打开输出目录」查看结果。
-   详细进度、失败原因都会显示在底部状态栏。
+3. 得到文字
+   几秒后文字出现在首页下方，可以直接修改。
+   点「复制文字」或按 Ctrl+Enter 复制，默认会「完成后自动复制到剪贴板」。
+   快捷键：F2 开始/结束录音；录音中按 Esc = 丢弃本次录音；转换中按 Esc = 取消转换。
+
+文件转写：处理已有的音频 / 视频
+
+· 切换到「📁 文件转写」页，添加 mp3 / wav / m4a / flac 等文件（也可以直接把文件拖进列表）。
+· 选择整理风格（口述成文 / 会议纪要 / 逐字稿润色 / 要点摘要）、音频语言、识别模型和导出格式。
+· 点击「开始处理」，程序会依次完成：语音转写 → DeepSeek 整理 → 导出文件。
+· 导出支持 txt / md / docx / srt，默认保存到程序目录下的 outputs/ 文件夹。
 
 轻量说明
 
 · 本地转写免费：语音识别完全在本机 CPU 上完成，音频不会上传到任何服务器。
-· AI 整理可选：需要在「设置」中填写 DeepSeek API Key 才会启用；没有 Key 也能正常转写。
-· API Key 安全：使用 Windows DPAPI 加密保存在本机，只有当前 Windows 用户能解密。
+· AI 整理可选：在「设置」中填写 DeepSeek API Key 后启用；没有 Key 时语音输入会自动退化为仅本地转写。
+· API Key 安全：使用 Windows DPAPI 加密保存在本机，只有当前 Windows 用户能解密；设置里留空保存不会清掉已保存的 Key。
 · 模型空闲自动卸载：默认空闲 5 分钟后自动释放识别模型占用的内存，可在设置中调整。
 · CPU 占用可控：默认最多使用 4 个线程，避免占满电脑资源。
 · 数据都在本地：配置在 data/config.json，录音在 data/recordings，日志在 data/logs/app.log。
-· 首次使用会自动下载识别模型（small 约 484MB），请保持网络畅通；下载一次后会复用本地缓存。
 
 小提示
 
-· 首次转写会比较慢，之后模型已缓存会快很多。
+· 第一次使用会自动加载识别模型，之后会复用本地缓存，速度快很多。
 · 识别效果不好时，可以在设置里换成更大的模型（medium / large-v3），但速度会更慢。
-· 整理结果不满意时，可以换一种整理风格，或只做「逐字稿润色」。
+· 整理结果不满意，可以换一种整理风格，或只做「逐字稿润色」。
 """
 
 

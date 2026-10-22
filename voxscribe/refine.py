@@ -309,8 +309,10 @@ class DeepSeekRefiner:
             raise CancelledError("任务已取消")
 
         options = options or RefineOptions()
+        # prompt 键以 voxscribe.models.STYLES 为准（oral / proofread / meeting /
+        # verbatim / summary）；大小写不敏感，未知风格回退 oral。
         style = prompts.style_key(options.style)
-        if (options.style or "").strip() not in STYLES:
+        if (options.style or "").strip().lower() not in STYLES:
             log.warning("未知的整理风格 %r，已回退为 oral", options.style)
         language = (options.language or "zh").strip() or "zh"
         temperature = max(0.0, min(2.0, _safe_float(options.temperature, 0.3)))

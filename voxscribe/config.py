@@ -98,6 +98,7 @@ class AppSettings:
     export_formats: List[str] = field(default_factory=lambda: ["txt", "md"])
     glossary: str = ""
     output_dir: str = ""  # 空 = outputs/
+    auto_copy: bool = True  # 语音输入完成后自动复制到剪贴板
 
     # --- 界面 ---
     window_geometry: str = ""

@@ -41,6 +41,14 @@ COLORS: Dict[str, str] = {
     "input_bg": "#ffffff",
     "trough": "#e6ebf4",
     "heading_bg": "#eef2f8",
+    # 语音输入（v1.1 首页）：录音红 + 波形蓝
+    "record": "#dc2626",
+    "record_dark": "#b91c1c",
+    "record_soft": "#fee2e2",
+    "wave_bg": "#f8fbff",
+    "wave_old": "#c9d9f5",
+    "wave_new": "#2563eb",
+    "wave_frozen": "#dbe6f7",
 }
 
 _FONT_CANDIDATES = (

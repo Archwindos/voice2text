@@ -100,6 +100,35 @@ namespace VoxScribe
         [DllImport("dwmapi.dll")]
         public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out RECT value, int size);
 
+        [DllImport("user32.dll")]
+        public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int cmdShow);
+
+        [DllImport("user32.dll")]
+        public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindow(IntPtr hWnd);
+
+        public static void RestoreWindow(IntPtr hWnd)
+        {
+            // SW_RESTORE(9)：窗口被最小化（含 Start-Process -WindowStyle Minimized）时恢复
+            try { ShowWindow(hWnd, 9); } catch (Exception) { }
+        }
+
+        public static void MakeTopMost(IntPtr hWnd)
+        {
+            // HWND_TOPMOST(-1)，SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE = 0x13
+            SetWindowPos(hWnd, new IntPtr(-1), 0, 0, 0, 0, 0x13);
+        }
+
+        public static void ClearTopMost(IntPtr hWnd)
+        {
+            SetWindowPos(hWnd, new IntPtr(-2), 0, 0, 0, 0, 0x13);
+        }
+
         public static bool EnableDpiAwareness()
         {
             // -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2，失败再回退旧 API
@@ -170,6 +199,7 @@ namespace VoxScribe
 $PreviousAutoClose = $env:VOXSCRIBE_GUI_AUTOCLOSE_MS
 $env:VOXSCRIBE_GUI_AUTOCLOSE_MS = "$AutoCloseMs"
 $process = $null
+$hwnd = [IntPtr]::Zero
 $screenshotOk = $false
 $exitCode = 1
 try {
@@ -184,7 +214,6 @@ try {
 
     # 等待主窗口出现（标题包含指定关键字，默认「语声成文」），最多 20 秒
     $deadline = (Get-Date).AddSeconds(20)
-    $hwnd = [IntPtr]::Zero
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 250
         $hwnd = [VoxScribe.Win32]::FindWindowByTitle($TitleMatch)
@@ -194,8 +223,18 @@ try {
     if ($hwnd -eq [IntPtr]::Zero) {
         throw "20 秒内没有找到窗口（标题包含：$TitleMatch）"
     }
-    Write-Host "已找到主窗口，等待 ${DelayMs}ms 后截图…"
+    # 临时恢复 + 置顶，避免窗口被最小化或被桌面上的其它窗口遮挡导致截到别人的画面
+    [VoxScribe.Win32]::RestoreWindow($hwnd)
+    [VoxScribe.Win32]::MakeTopMost($hwnd)
+    Write-Host "已找到主窗口（临时置顶），等待 ${DelayMs}ms 后截图…"
     Start-Sleep -Milliseconds $DelayMs
+    if (-not [VoxScribe.Win32]::IsWindow($hwnd)) {
+        $hwnd = [VoxScribe.Win32]::FindWindowByTitle($TitleMatch)
+        if ($hwnd -eq [IntPtr]::Zero) { throw "截图前窗口已关闭（标题包含：$TitleMatch）" }
+    }
+    [VoxScribe.Win32]::RestoreWindow($hwnd)
+    [VoxScribe.Win32]::MakeTopMost($hwnd)
+    Start-Sleep -Milliseconds 350
 
     if ($FullScreen) {
         $bounds = [VoxScribe.Win32]::GetScreenSize()
@@ -203,6 +242,19 @@ try {
         $width = [int]$bounds[0]; $height = [int]$bounds[1]
     } else {
         $rect = [VoxScribe.Win32]::GetVisibleRectArray($hwnd)
+        for ($attempt = 0; $attempt -lt 3; $attempt++) {
+            if ($rect.Count -eq 4) {
+                $candidateWidth = [int]$rect[2] - [int]$rect[0]
+                $candidateHeight = [int]$rect[3] - [int]$rect[1]
+                if ($candidateWidth -gt 100 -and $candidateHeight -gt 100) { break }
+            }
+            [VoxScribe.Win32]::RestoreWindow($hwnd)
+            [VoxScribe.Win32]::MakeTopMost($hwnd)
+            Start-Sleep -Milliseconds 500
+            $hwnd = [VoxScribe.Win32]::FindWindowByTitle($TitleMatch)
+            if ($hwnd -eq [IntPtr]::Zero) { throw "截图前窗口已关闭（标题包含：$TitleMatch）" }
+            $rect = [VoxScribe.Win32]::GetVisibleRectArray($hwnd)
+        }
         if ($rect.Count -ne 4) { throw "无法获取窗口位置" }
         $left = [int]$rect[0]; $top = [int]$rect[1]
         $width = [int]$rect[2] - $left
@@ -216,19 +268,57 @@ try {
     }
     if ($width -le 0 -or $height -le 0) { throw "窗口尺寸无效：${width}x${height}" }
 
-    $bitmap = New-Object System.Drawing.Bitmap([int]$width, [int]$height)
-    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    try {
-        $graphics.CopyFromScreen([int]$left, [int]$top, 0, 0, $bitmap.Size)
-        $bitmap.Save($OutFile, [System.Drawing.Imaging.ImageFormat]::Png)
-    } finally {
-        $graphics.Dispose()
-        $bitmap.Dispose()
+    $captured = $false
+    if (-not $FullScreen) {
+        # 优先用 PrintWindow 直接渲染窗口内容：即使窗口被其它程序遮挡也能截到，
+        # 不需要抢占用户前台，也不会截到别人的画面。
+        $windowRect = [VoxScribe.Win32]::GetRectArray($hwnd)
+        if ($windowRect.Count -eq 4) {
+            $windowWidth = [int]$windowRect[2] - [int]$windowRect[0]
+            $windowHeight = [int]$windowRect[3] - [int]$windowRect[1]
+            if ($windowWidth -gt 100 -and $windowHeight -gt 100) {
+                $bitmap = New-Object System.Drawing.Bitmap($windowWidth, $windowHeight)
+                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                try {
+                    $hdc = $graphics.GetHdc()
+                    try {
+                        $captured = [VoxScribe.Win32]::PrintWindow($hwnd, $hdc, 2)  # PW_RENDERFULLCONTENT = 2
+                    } finally {
+                        $graphics.ReleaseHdc($hdc)
+                    }
+                    if ($captured) {
+                        $bitmap.Save($OutFile, [System.Drawing.Imaging.ImageFormat]::Png)
+                        $width = $windowWidth
+                        $height = $windowHeight
+                    }
+                } finally {
+                    $graphics.Dispose()
+                    $bitmap.Dispose()
+                }
+            }
+        }
+    }
+    if (-not $captured) {
+        # 回退：窗口可见且置顶时直接截屏
+        [VoxScribe.Win32]::MakeTopMost($hwnd)
+        Start-Sleep -Milliseconds 250
+        $bitmap = New-Object System.Drawing.Bitmap([int]$width, [int]$height)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $graphics.CopyFromScreen([int]$left, [int]$top, 0, 0, $bitmap.Size)
+            $bitmap.Save($OutFile, [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally {
+            $graphics.Dispose()
+            $bitmap.Dispose()
+        }
     }
     $info = Get-Item $OutFile
     Write-Host ("截图已保存：{0}（{1}x{2}，{3} bytes）" -f $info.FullName, $width, $height, $info.Length)
     $screenshotOk = $true
 } finally {
+    if ($hwnd -ne [IntPtr]::Zero) {
+        try { [VoxScribe.Win32]::ClearTopMost($hwnd) } catch { }
+    }
     if ($null -ne $PreviousAutoClose) {
         $env:VOXSCRIBE_GUI_AUTOCLOSE_MS = $PreviousAutoClose
     } else {
