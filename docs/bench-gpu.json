@@ -1,0 +1,144 @@
+{
+  "engine": "faster-whisper CUDA float16",
+  "model": "medium",
+  "audio": [
+    {
+      "name": "zh_fixture_13s",
+      "path": "D:\\Project\\voice2text\\data\\bench\\audio\\zh_fixture.wav",
+      "language": "zh",
+      "runs": [
+        {
+          "run": 1,
+          "seconds": 1.075,
+          "cpu_seconds": 1.359,
+          "cpu_percent": 126.5,
+          "rss_mb": 714,
+          "text": "嗯,那个,我们今天主要讨论一下项目的进度问题。\n前端已经完成了70%,后端还需要两周时间,就是这样。"
+        },
+        {
+          "run": 2,
+          "seconds": 0.779,
+          "cpu_seconds": 0.75,
+          "cpu_percent": 96.2,
+          "rss_mb": 719,
+          "text": "嗯,那个,我们今天主要讨论一下项目的进度问题。\n前端已经完成了70%,后端还需要两周时间,就是这样。"
+        },
+        {
+          "run": 3,
+          "seconds": 0.775,
+          "cpu_seconds": 0.734,
+          "cpu_percent": 94.8,
+          "rss_mb": 719,
+          "text": "嗯,那个,我们今天主要讨论一下项目的进度问题。\n前端已经完成了70%,后端还需要两周时间,就是这样。"
+        }
+      ],
+      "median_seconds": 0.779,
+      "min_seconds": 0.775,
+      "warm_median_seconds": 0.777
+    },
+    {
+      "name": "zh_short_21s",
+      "path": "D:\\Project\\voice2text\\data\\bench\\audio\\zh_short.wav",
+      "language": "zh",
+      "runs": [
+        {
+          "run": 1,
+          "seconds": 1.159,
+          "cpu_seconds": 1.078,
+          "cpu_percent": 93.0,
+          "rss_mb": 720,
+          "text": "今天我们主要讨论一下这个项目的进度问题\n前端已经完成了70%\n后端可能还需要两周时间\n另外测试环境也要提前准备好\n确保上线之前所有功能都经过验证"
+        },
+        {
+          "run": 2,
+          "seconds": 1.155,
+          "cpu_seconds": 1.125,
+          "cpu_percent": 97.4,
+          "rss_mb": 720,
+          "text": "今天我们主要讨论一下这个项目的进度问题\n前端已经完成了70%\n后端可能还需要两周时间\n另外测试环境也要提前准备好\n确保上线之前所有功能都经过验证"
+        },
+        {
+          "run": 3,
+          "seconds": 1.142,
+          "cpu_seconds": 1.156,
+          "cpu_percent": 101.2,
+          "rss_mb": 720,
+          "text": "今天我们主要讨论一下这个项目的进度问题\n前端已经完成了70%\n后端可能还需要两周时间\n另外测试环境也要提前准备好\n确保上线之前所有功能都经过验证"
+        }
+      ],
+      "median_seconds": 1.155,
+      "min_seconds": 1.142,
+      "warm_median_seconds": 1.148
+    },
+    {
+      "name": "zh_long_50s",
+      "path": "D:\\Project\\voice2text\\data\\bench\\audio\\zh_long.wav",
+      "language": "zh",
+      "runs": [
+        {
+          "run": 1,
+          "seconds": 2.88,
+          "cpu_seconds": 4.203,
+          "cpu_percent": 145.9,
+          "rss_mb": 723,
+          "text": "下面我来说一下这次改版的重点\n第一\n语音输入页要保持足够简洁\n用户按下快捷键之后马上开始录音\n再按一次就结束并自动转写\n第二\n识别出来的文字要经过整理\n去掉口头禅和重复的内容\n同时保留原来的数字\n人名和专有名字\n第三\n文件转写页要支持批量处理\n可以导出文本\nMarkdown和word文档\n最后\n整个软件要尽量轻量\n不要占用太多内存\n也不要在后台偷偷运行耗电的程序"
+        },
+        {
+          "run": 2,
+          "seconds": 2.894,
+          "cpu_seconds": 4.031,
+          "cpu_percent": 139.3,
+          "rss_mb": 724,
+          "text": "下面我来说一下这次改版的重点\n第一\n语音输入页要保持足够简洁\n用户按下快捷键之后马上开始录音\n再按一次就结束并自动转写\n第二\n识别出来的文字要经过整理\n去掉口头禅和重复的内容\n同时保留原来的数字\n人名和专有名字\n第三\n文件转写页要支持批量处理\n可以导出文本\nMarkdown和word文档\n最后\n整个软件要尽量轻量\n不要占用太多内存\n也不要在后台偷偷运行耗电的程序"
+        },
+        {
+          "run": 3,
+          "seconds": 2.889,
+          "cpu_seconds": 4.188,
+          "cpu_percent": 144.9,
+          "rss_mb": 724,
+          "text": "下面我来说一下这次改版的重点\n第一\n语音输入页要保持足够简洁\n用户按下快捷键之后马上开始录音\n再按一次就结束并自动转写\n第二\n识别出来的文字要经过整理\n去掉口头禅和重复的内容\n同时保留原来的数字\n人名和专有名字\n第三\n文件转写页要支持批量处理\n可以导出文本\nMarkdown和word文档\n最后\n整个软件要尽量轻量\n不要占用太多内存\n也不要在后台偷偷运行耗电的程序"
+        }
+      ],
+      "median_seconds": 2.889,
+      "min_seconds": 2.88,
+      "warm_median_seconds": 2.891
+    },
+    {
+      "name": "en_short_16s",
+      "path": "D:\\Project\\voice2text\\data\\bench\\audio\\en_short.wav",
+      "language": "en",
+      "runs": [
+        {
+          "run": 1,
+          "seconds": 0.911,
+          "cpu_seconds": 0.922,
+          "cpu_percent": 101.2,
+          "rss_mb": 726,
+          "text": "Today we need to review the new audio engine.\nThe reverb sounds much better, but the mix is still too loud.\nPlease check the final export before tomorrow's release, and make sure the voice track stays in sync with the video."
+        },
+        {
+          "run": 2,
+          "seconds": 0.91,
+          "cpu_seconds": 0.891,
+          "cpu_percent": 97.9,
+          "rss_mb": 726,
+          "text": "Today we need to review the new audio engine.\nThe reverb sounds much better, but the mix is still too loud.\nPlease check the final export before tomorrow's release, and make sure the voice track stays in sync with the video."
+        },
+        {
+          "run": 3,
+          "seconds": 0.902,
+          "cpu_seconds": 0.828,
+          "cpu_percent": 91.8,
+          "rss_mb": 726,
+          "text": "Today we need to review the new audio engine.\nThe reverb sounds much better, but the mix is still too loud.\nPlease check the final export before tomorrow's release, and make sure the voice track stays in sync with the video."
+        }
+      ],
+      "median_seconds": 0.91,
+      "min_seconds": 0.902,
+      "warm_median_seconds": 0.906
+    }
+  ],
+  "load_seconds": 2.83,
+  "rss_after_load_mb": 726
+}

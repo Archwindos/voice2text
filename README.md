@@ -319,6 +319,9 @@ v1.3.1 起默认语言为「自动检测」：英文语音会输出英文，不�
 **16. 桌面快捷方式启动时报 CUDA/cublas 错误？**
 v1.3.3 起桌面快捷方式使用自带的 `VoxScribe.exe` 无黑框启动器，会自动读取 venv 依赖目录；如仍报 CUDA 错误，先运行一次 `setup.bat` 补装 CUDA 运行库。
 
+**17. 用 NVIDIA GPU 还是 Intel NPU？**
+本机实测（RTX 5060 Laptop vs Intel AI Boost NPU，Whisper medium）：GPU 13 秒音频 **0.78 秒** 出结果，NPU 需要 **2.46 秒**，且首次编译模型要 6~8 分钟、内存约 4GB。**继续用 NVIDIA GPU 是最优选择**。完整测试数据见 [docs/benchmark-gpu-vs-npu.md](docs/benchmark-gpu-vs-npu.md)。
+
 ## 十三、项目结构
 
 ```
