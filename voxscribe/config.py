@@ -80,7 +80,7 @@ class AppSettings:
     asr_device: str = "cuda"  # cuda / cpu；用户要求默认走 GPU
     compute_type: str = "auto"  # auto = cuda→float16 / cpu→int8
     cpu_threads: int = 0  # 仅 CPU 模式使用；0 = 自动（最多 4 线程）
-    language: str = "zh"  # zh / en / ja / ko / auto
+    language: str = "auto"  # auto / zh / en / ja / ko；自动检测可中英混说
     beam_size: int = 5
     vad_filter: bool = True
     model_dir: str = ""  # 空 = data/models

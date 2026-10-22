@@ -16,6 +16,7 @@ def test_defaults() -> None:
     assert settings.asr_model == "medium"
     assert settings.api_model == "deepseek-chat"
     assert settings.api_base_url.startswith("https://")
+    assert settings.language == "auto"  # 默认自动检测，中英混说不会被强制翻译
     assert 1 <= settings.effective_threads() <= 4
     assert settings.idle_unload_seconds() == 0  # 默认常驻，保证口述响应速度
     assert settings.close_to_tray is True

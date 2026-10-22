@@ -391,6 +391,13 @@ def test_home_minimal_layout_and_half_wave(gui_env):
         # 波形高度压缩到约 80~100（96dpi 设计值，随 DPI 缩放）
         wave_height = int(window.wave_canvas.cget("height"))
         assert 60 <= wave_height <= 160, wave_height
+        # v1.3.1：波形高度映射保留顶部余量，正常说话不会顶到上沿
+        from voxscribe.gui.app import _wave_visual
+
+        assert _wave_visual(1.0) <= 0.8
+        assert _wave_visual(0.8) < 0.8
+        assert _wave_visual(0.5) < 0.6
+        assert _wave_visual(0.0) == 0.0
         # 空闲波形区内不再有小字（只有基线与刻度线）
         window._draw_home_idle()
         types = {window.wave_canvas.type(item) for item in window.wave_canvas.find_all()}

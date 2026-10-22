@@ -246,6 +246,8 @@ def test_proofread_style_prompt_and_result(server, refiner, sample_transcript):
         "音轨",
         "术语表",
         "口头禅",
+        "不要翻译",
+        "英文",
     ):
         assert keyword in system, f"proofread system prompt 缺少关键词：{keyword}"
     # 整词误识别示例：阴轨→音轨、以下→一下、在确认→再确认、帐目→账目

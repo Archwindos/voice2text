@@ -177,6 +177,18 @@ def _clamp01(value: Any) -> float:
         return 0.0
 
 
+def _wave_visual(level: float) -> float:
+    """把归一化音量映射成波形高度比例（0~0.8）。
+
+    保留顶部 20% 余量：正常说话（0.2~0.8）对应约 24%~78% 高度，
+    即使很响的瞬间也不会顶到波形区上沿。
+    """
+    value = _clamp01(level)
+    if value < 0.01:  # 噪声门：安静时不画明显波形
+        return 0.0
+    return min(0.8, (value ** 0.85) * 0.95)
+
+
 def _blend_color(start: str, end: str, ratio: float) -> str:
     """在两个 ``#rrggbb`` 颜色之间线性插值。"""
     ratio = max(0.0, min(1.0, float(ratio)))
@@ -997,8 +1009,8 @@ class MainWindow:
                 if level < 0.01:  # 噪声门：安静时只留最小柱
                     amplitude = min_height
                 else:
-                    # 视觉放大：安静环境 0.008 接近平线，正常说话 0.2~0.8 起伏明显
-                    visual = min(1.0, level * 1.6) ** 0.8
+                    # 视觉映射：保留顶部 20% 余量，正常说话不会顶到上沿
+                    visual = _wave_visual(level)
                     amplitude = max(min_height, visual * max_height)
                 ratio = (index + 1) / float(len(values))
                 color = _blend_color(COLORS["wave_old"], COLORS["wave_new"], ratio)
@@ -1034,7 +1046,7 @@ class MainWindow:
                     x = (offset + index + 0.5) * slot
                     level = max(0.0, min(1.0, value))
                     amplitude = max(
-                        theme.px(1), (min(1.0, level * 1.6) ** 0.8) * max_height
+                        theme.px(1), _wave_visual(level) * max_height
                     )
                     self.wave_canvas.create_line(
                         x,
