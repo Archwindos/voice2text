@@ -22,6 +22,28 @@ STYLES: Dict[str, str] = {
 
 EXPORT_FORMATS = ("txt", "md", "docx", "srt")
 
+#: 语音输入的三种输出模式（首页选择，直接影响 prompt 与思考强度）
+QUICK_MODES: Dict[str, Dict[str, str]] = {
+    "direct": {
+        "label": "直出",
+        "style": "direct",
+        "reasoning_effort": "none",
+        "hint": "原汁原味，只纠错",
+    },
+    "person": {
+        "label": "对人",
+        "style": "person",
+        "reasoning_effort": "low",
+        "hint": "整理成发给人的正式消息",
+    },
+    "ai": {
+        "label": "对AI",
+        "style": "ai",
+        "reasoning_effort": "high",
+        "hint": "整理成给 AI 的清晰提示词",
+    },
+}
+
 
 def format_timestamp(seconds: float) -> str:
     """把秒数格式化为 ``HH:MM:SS``（用于预览与文本时间戳）。"""
@@ -118,6 +140,8 @@ class RefineOptions:
     temperature: float = 0.3
     max_chunk_chars: int = 2800
     chunk_overlap_chars: int = 120
+    #: DeepSeek 思考强度：none / low / medium / high ...（空 = 用 refiner 默认值）
+    reasoning_effort: str = ""
 
 
 @dataclass
@@ -154,6 +178,7 @@ class JobOptions:
     export_formats: List[str] = field(default_factory=lambda: ["txt", "md"])
     output_dir: Optional[str] = None
     title: Optional[str] = None
+    reasoning_effort: Optional[str] = None  # None = 用设置默认（none）
 
 
 @dataclass
@@ -189,6 +214,7 @@ class JobEvent:
 
 __all__ = [
     "STYLES",
+    "QUICK_MODES",
     "EXPORT_FORMATS",
     "format_timestamp",
     "format_srt_timestamp",

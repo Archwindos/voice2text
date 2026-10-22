@@ -1,6 +1,6 @@
 [project]
 name = "voxscribe"
-version = "1.4.0"
+version = "1.5.0"
 description = "VoxScribe 语声成文：本地 GPU 语音转写 + DeepSeek 文本整理"
 requires-python = ">=3.10"
 dependencies = [

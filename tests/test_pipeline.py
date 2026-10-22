@@ -338,3 +338,27 @@ def test_apply_settings_reloads_asr(tmp_path: Path, fake_export) -> None:
 
     pipe.run(_audio(tmp_path), JobOptions(refine=False), emit)
     assert len(factory_calls) == 2
+
+
+def test_quick_mode_reasoning_effort_passed_to_refiner(tmp_path: Path) -> None:
+    """语音输入三模式：style 与 reasoning_effort 原样传给 refiner。"""
+    settings = _settings(tmp_path)
+    asr = FakeASR()
+    refiner = FakeRefiner()
+    pipe = _make_pipeline(settings, asr, refiner)
+    events, emit = _collect()
+    cases = (
+        ("direct", "none"),
+        ("person", "low"),
+        ("ai", "high"),
+    )
+    for style, effort in cases:
+        refiner.last_options = None
+        pipe.transcribe_and_refine(
+            _audio(tmp_path),
+            JobOptions(refine=True, style=style, reasoning_effort=effort),
+            emit,
+        )
+        assert refiner.last_options is not None
+        assert refiner.last_options.style == style
+        assert refiner.last_options.reasoning_effort == effort

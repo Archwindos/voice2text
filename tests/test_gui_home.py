@@ -350,13 +350,42 @@ def test_two_stage_shows_raw_transcript_before_refine(gui_env, monkeypatch):
 # ---------------------------------------------------------------------------
 # 转换流程与降级
 # ---------------------------------------------------------------------------
-def test_conversion_passes_proofread_style(gui_env, monkeypatch):
+def test_conversion_passes_direct_mode(gui_env, monkeypatch):
     root, window = _make_window(gui_env, api_key="sk-test-home")
     captured = _patch_pipeline(window, monkeypatch, refined=True)
     try:
         _run_quick_flow(window)
         assert captured["job"].refine is True
-        assert captured["job"].style == "proofread"
+        assert captured["job"].style == "direct"
+        assert captured["job"].reasoning_effort == "none"
+    finally:
+        _close_window(window)
+
+
+def test_quick_mode_selector_switches_prompt_and_effort(gui_env, monkeypatch):
+    """直出/对人/对AI 三种模式分别对应不同 prompt 与思考强度。"""
+    root, window = _make_window(gui_env, api_key="sk-test-home")
+    captured = _patch_pipeline(window, monkeypatch, refined=True)
+    try:
+        assert set(window.quick_mode_buttons) == {"direct", "person", "ai"}
+        assert window._quick_mode == "direct"
+        assert "只纠错" in window.quick_mode_hint_var.get()
+
+        window._set_quick_mode("person")
+        assert window.settings.quick_mode == "person"
+        _run_quick_flow(window)
+        assert captured["job"].style == "person"
+        assert captured["job"].reasoning_effort == "low"
+
+        window._set_quick_mode("ai")
+        _run_quick_flow(window)
+        assert captured["job"].style == "ai"
+        assert captured["job"].reasoning_effort == "high"
+
+        window._set_quick_mode("direct")
+        _run_quick_flow(window)
+        assert captured["job"].style == "direct"
+        assert captured["job"].reasoning_effort == "none"
     finally:
         _close_window(window)
 
@@ -444,7 +473,7 @@ def test_no_api_key_degrades_to_local_transcribe(gui_env, monkeypatch):
         _run_quick_flow(window)
 
         assert captured["job"].refine is False
-        assert captured["job"].style == "proofread"
+        assert captured["job"].style == "direct"
         assert window._get_home_text() == FAKE_RAW
         meta = window.home_result_info_var.get()
         assert "仅本地转写" in meta

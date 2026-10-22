@@ -50,7 +50,7 @@ def _default_refiner_factory(settings: AppSettings, api_key: str) -> DeepSeekRef
         model=settings.api_model,
         timeout=settings.api_timeout,
         max_retries=settings.api_max_retries,
-        thinking_disabled=settings.api_thinking_disabled,
+        reasoning_effort=settings.api_reasoning_effort,
     )
 
 
@@ -239,6 +239,7 @@ class Pipeline:
                     else (transcript.language or "zh")
                 ),
                 glossary=self.settings.glossary,
+                reasoning_effort=job.reasoning_effort or "",
             )
 
             def on_refine_progress(ratio: float, message: str) -> None:

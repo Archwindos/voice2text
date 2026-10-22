@@ -174,10 +174,10 @@ def test_single_chunk_success(server, refiner, sample_transcript):
 
     payload = request.json
     assert payload["model"] == "deepseek-flash"
-    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["reasoning_effort"] == "none"
     assert payload["stream"] is False
     assert payload["max_tokens"] == MAX_OUTPUT_TOKENS
-    assert payload["max_tokens"] == 4096
+    assert payload["max_tokens"] == 8192
     assert payload["temperature"] == pytest.approx(0.3)
     assert [m["role"] for m in payload["messages"]] == ["system", "user"]
     assert system_content(payload) == prompts.system_prompt("oral", "zh")
@@ -209,11 +209,11 @@ def test_fixed_response(server, sample_transcript):
 
 
 def test_all_styles_use_their_system_prompt(server, sample_transcript):
-    # v1.1 起共 5 种风格（新增「口述校对」），prompt 表必须与 models.STYLES 同步
+    # 文件转写页仍只有 5 种风格；语音输入另有 direct/person/ai 三种 prompt
     assert set(STYLES) == {"oral", "proofread", "meeting", "verbatim", "summary"}
     assert "proofread" in STYLES
-    assert len(prompts.STYLE_PROMPTS) == 5
-    assert set(prompts.STYLE_PROMPTS) == set(STYLES)
+    assert len(prompts.STYLE_PROMPTS) == 8
+    assert set(prompts.STYLE_PROMPTS) == set(STYLES) | {"direct", "person", "ai"}
     for style in STYLES:
         client = make_refiner(server)
         try:
@@ -224,6 +224,29 @@ def test_all_styles_use_their_system_prompt(server, sample_transcript):
         assert system_content(server.last_request.json) == prompts.system_prompt(
             style, "zh"
         )
+
+
+def test_quick_modes_prompt_and_reasoning_effort(server, sample_transcript):
+    """语音输入三模式：直出无思考 / 对人 low / 对AI high。"""
+    cases = (
+        ("direct", "none", "原汁原味"),
+        ("person", "low", "即时消息"),
+        ("ai", "high", "提示词"),
+    )
+    for style, effort, keyword in cases:
+        client = make_refiner(server)
+        try:
+            result = client.refine(
+                sample_transcript,
+                RefineOptions(style=style, reasoning_effort=effort),
+            )
+        finally:
+            client.close()
+        payload = server.last_request.json
+        assert payload["reasoning_effort"] == effort
+        assert system_content(payload) == prompts.system_prompt(style, "zh")
+        assert keyword in system_content(payload)
+        assert result.text == sample_transcript.text
 
 
 def test_proofread_style_prompt_and_result(server, refiner, sample_transcript):

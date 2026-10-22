@@ -87,10 +87,11 @@ class AppSettings:
     input_device: str = ""  # 麦克风设备名；空 = 系统默认输入设备
     idle_unload_minutes: int = 0  # 0 = 常驻不卸载（保证口述响应速度）
 
-    # --- DeepSeek 文本整理（deepseek-flash，关闭思考模式，低延迟）---
+    # --- DeepSeek 文本整理（deepseek-flash）---
     api_base_url: str = "https://api.deepseek.com"
     api_model: str = "deepseek-flash"
-    api_thinking_disabled: bool = True  # True = 关闭思考模式（最快、直接输出正文）
+    #: 默认思考强度；语音输入三模式会按模式覆盖（none/low/high）
+    api_reasoning_effort: str = "none"
     api_timeout: int = 120
     api_max_retries: int = 2
     api_key_enc: str = ""  # DPAPI 密文；兼容 plain: 明文
@@ -102,6 +103,7 @@ class AppSettings:
     glossary: str = ""
     output_dir: str = ""  # 空 = outputs/
     auto_copy: bool = True  # 语音输入完成后自动复制到剪贴板
+    quick_mode: str = "direct"  # 语音输入模式：direct / person / ai
 
     # --- 界面 ---
     window_geometry: str = ""

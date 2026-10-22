@@ -36,7 +36,7 @@ import requests
 
 from . import prompts
 from .errors import CancelledError, RefineError
-from .models import STYLES, RefineOptions, RefineResult, RefineUsage, Transcript
+from .models import RefineOptions, RefineResult, RefineUsage, Transcript
 
 log = logging.getLogger(__name__)
 
@@ -44,9 +44,27 @@ ProgressCallback = Callable[[float, str], None]
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
-MAX_OUTPUT_TOKENS = 4096
+MAX_OUTPUT_TOKENS = 8192
 DEFAULT_MAX_CHUNK_CHARS = 2800
 DEFAULT_CHUNK_OVERLAP_CHARS = 120
+
+#: DeepSeek V4 系列支持的思考强度档位（API 字段 reasoning_effort）
+REASONING_EFFORTS = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "ultra",
+    "max",
+)
+
+
+def normalize_reasoning_effort(value: str, default: str = "none") -> str:
+    """把配置/调用方传入的思考强度规范化为 API 支持的值。"""
+    effort = str(value or "").strip().lower()
+    return effort if effort in REASONING_EFFORTS else default
 
 # 重试等待：第 n 次失败后等待 RETRY_BASE_SECONDS * 2**(n-1) 秒，上限 RETRY_MAX_SECONDS。
 # 测试可以 monkeypatch 这些常量来避免真实等待。
@@ -266,14 +284,14 @@ class DeepSeekRefiner:
         model: str = "deepseek-flash",
         timeout: float = 120.0,
         max_retries: int = 2,
-        thinking_disabled: bool = True,
+        reasoning_effort: str = "none",
     ) -> None:
         self._api_key = (api_key or "").strip()
         self.base_url = normalize_base_url(base_url)
         self.chat_url = self.base_url + CHAT_COMPLETIONS_PATH
         self.model = (model or "deepseek-flash").strip() or "deepseek-flash"
-        # True = 请求体带 thinking: {"type": "disabled"}，关闭思考模式（低延迟）
-        self.thinking_disabled = bool(thinking_disabled)
+        # 默认思考强度：none（不思考）/ low / medium / high ...
+        self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
 
         timeout_value = _safe_float(timeout, 120.0)
         if timeout_value <= 0:
@@ -312,10 +330,10 @@ class DeepSeekRefiner:
             raise CancelledError("任务已取消")
 
         options = options or RefineOptions()
-        # prompt 键以 voxscribe.models.STYLES 为准（oral / proofread / meeting /
-        # verbatim / summary）；大小写不敏感，未知风格回退 oral。
-        style = prompts.style_key(options.style)
-        if (options.style or "").strip().lower() not in STYLES:
+        # prompt 键：文件页 5 种风格 + 语音输入 direct/person/ai；未知回退 oral。
+        raw_style = (options.style or "").strip().lower()
+        style = prompts.style_key(raw_style)
+        if raw_style not in prompts.STYLE_PROMPTS:
             log.warning("未知的整理风格 %r，已回退为 oral", options.style)
         language = (options.language or "zh").strip() or "zh"
         temperature = max(0.0, min(2.0, _safe_float(options.temperature, 0.3)))
@@ -367,6 +385,7 @@ class DeepSeekRefiner:
                 max_tokens=MAX_OUTPUT_TOKENS,
                 cancel=cancel,
                 purpose=f"整理第 {index}/{total} 段",
+                reasoning_effort=options.reasoning_effort or self.reasoning_effort,
             )
             parts.append(content)
             usage.add(chunk_usage)
@@ -404,6 +423,7 @@ class DeepSeekRefiner:
             max_tokens=prompts.CONNECTION_MAX_TOKENS,
             cancel=threading.Event(),
             purpose="连接测试",
+            reasoning_effort="none",
         )
         log.info(
             "DeepSeek 连接测试成功：用时 %.1f 秒，回复 %d 字符，tokens=%d",
@@ -439,6 +459,7 @@ class DeepSeekRefiner:
         max_tokens: int,
         cancel: threading.Event,
         purpose: str,
+        reasoning_effort: str = "",
     ) -> Tuple[str, RefineUsage]:
         """发送一次（带重试的）chat.completions 请求，返回 (正文, usage)。
 
@@ -452,12 +473,14 @@ class DeepSeekRefiner:
             "max_tokens": int(max_tokens),
             "stream": False,
         }
-        if self.thinking_disabled:
-            # 仅对支持「思考开关」的新模型发送该参数；旧模型（如 deepseek-chat）
-            # 收到 thinking 字段可能直接 400，因此按模型名判断。
-            model_lower = self.model.lower()
-            if "flash" in model_lower or "v4" in model_lower:
-                payload["thinking"] = {"type": "disabled"}
+        # reasoning_effort 仅 DeepSeek V4 系列支持；旧模型（deepseek-chat 等）
+        # 发送该字段可能报错，因此按模型名判断。
+        model_lower = self.model.lower()
+        if "flash" in model_lower or "v4" in model_lower:
+            effort = normalize_reasoning_effort(
+                reasoning_effort or self.reasoning_effort
+            )
+            payload["reasoning_effort"] = effort
         max_attempts = self.max_retries + 1
         attempt = 0
 

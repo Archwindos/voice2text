@@ -48,6 +48,7 @@ from ..config import (
 from ..errors import CancelledError, VoxError
 from ..models import (
     EXPORT_FORMATS,
+    QUICK_MODES,
     STYLES,
     JobEvent,
     JobOptions,
@@ -73,9 +74,8 @@ APP_TITLE = "语声成文 VoxScribe"
 APP_DISPLAY_NAME = "语声成文"
 APP_SUBTITLE = "口述成文 · 本地转写 + DeepSeek 整理"
 
-#: 首页固定使用的整理风格
-QUICK_STYLE = "proofread"
-QUICK_STYLE_LABEL = STYLES.get(QUICK_STYLE, "口述校对")
+#: 首页三种输出模式（键顺序即界面按钮顺序）
+QUICK_MODE_ORDER = ("direct", "person", "ai")
 HOME_PLACEHOLDER = "转换后的文字会出现在这里，可直接复制或修改"
 FULL_WIDTH_SPACE = "\u3000"
 START_BUTTON_TEXT = "● 开始录音"
@@ -672,6 +672,44 @@ class MainWindow:
         input_card, input_body = theme_module.make_card(page, theme)
         input_card.grid(row=0, column=0, sticky="ew")
 
+        # 输出模式：直出 / 对人 / 对AI（切换只影响 DeepSeek prompt 与思考强度）
+        mode_row = tk.Frame(input_body, bg=colors["card"])
+        mode_row.pack(pady=(theme.px(8), 0))
+        tk.Label(
+            mode_row,
+            text="模式",
+            bg=colors["card"],
+            fg=colors["muted"],
+            font=theme.font(SMALL_SIZE),
+        ).pack(side="left", padx=(0, theme.px(8)))
+        self.quick_mode_buttons: Dict[str, tk.Button] = {}
+        for mode_key in QUICK_MODE_ORDER:
+            label = QUICK_MODES[mode_key]["label"]
+            button = tk.Button(
+                mode_row,
+                text=label,
+                command=lambda key=mode_key: self._set_quick_mode(key),
+                font=theme.font(SMALL_SIZE, "bold"),
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                padx=theme.px(12),
+                pady=theme.px(2),
+                cursor="hand2",
+            )
+            button.pack(side="left", padx=(0, theme.px(5)))
+            self.quick_mode_buttons[mode_key] = button
+        self.quick_mode_hint_var = tk.StringVar(value="")
+        tk.Label(
+            mode_row,
+            textvariable=self.quick_mode_hint_var,
+            bg=colors["card"],
+            fg=colors["muted"],
+            font=theme.font(SMALL_SIZE),
+        ).pack(side="left", padx=(theme.px(8), 0))
+        self._sync_quick_mode_from_settings(refresh=False)
+        self._refresh_quick_mode_buttons()
+
         self.home_record_btn = tk.Button(
             input_body,
             text=START_BUTTON_TEXT,
@@ -844,6 +882,63 @@ class MainWindow:
             self.home_result_info_var.set(text or "")
         except (tk.TclError, AttributeError):  # pragma: no cover
             pass
+
+    # ------------------------------------------------------------------
+    # 首页：输出模式（直出 / 对人 / 对AI）
+    # ------------------------------------------------------------------
+    def _quick_mode_config(self) -> Dict[str, str]:
+        mode = getattr(self, "_quick_mode", "direct")
+        return QUICK_MODES.get(mode, QUICK_MODES["direct"])
+
+    def _sync_quick_mode_from_settings(self, *, refresh: bool = True) -> None:
+        """把持久化的 quick_mode 同步成当前模式（非法值回退直出）。"""
+        mode = (getattr(self.settings, "quick_mode", "") or "direct").strip().lower()
+        if mode not in QUICK_MODES:
+            mode = "direct"
+        self._quick_mode = mode
+        try:
+            self.quick_mode_hint_var.set(QUICK_MODES[mode]["hint"])
+        except (AttributeError, tk.TclError):  # pragma: no cover - 构建期
+            pass
+        if refresh:
+            self._refresh_quick_mode_buttons()
+
+    def _refresh_quick_mode_buttons(self) -> None:
+        mode = getattr(self, "_quick_mode", "direct")
+        busy = getattr(self, "_quick_state", "idle") != "idle" or bool(
+            getattr(self, "_processing", False)
+        )
+        for key, button in getattr(self, "quick_mode_buttons", {}).items():
+            selected = key == mode
+            try:
+                button.configure(
+                    bg=COLORS["primary"] if selected else COLORS["card_alt"],
+                    fg=COLORS["primary_ink"] if selected else COLORS["text"],
+                    activebackground=COLORS["primary_dark"] if selected else COLORS["border"],
+                    activeforeground=COLORS["primary_ink"] if selected else COLORS["text"],
+                    disabledforeground=COLORS["primary_ink"] if selected else COLORS["faint"],
+                    state="disabled" if busy else "normal",
+                    cursor="arrow" if busy else "hand2",
+                )
+            except tk.TclError:  # pragma: no cover - 窗口销毁中
+                continue
+
+    def _set_quick_mode(self, mode: str) -> None:
+        """切换输出模式并持久化；录音/转换过程中不允许切换。"""
+        if mode not in QUICK_MODES:
+            return
+        if getattr(self, "_quick_state", "idle") != "idle" or getattr(self, "_processing", False):
+            return
+        if mode == getattr(self, "_quick_mode", ""):
+            return
+        self._quick_mode = mode
+        self.settings.quick_mode = mode
+        self._schedule_save()
+        try:
+            self.quick_mode_hint_var.set(QUICK_MODES[mode]["hint"])
+        except (AttributeError, tk.TclError):  # pragma: no cover
+            pass
+        self._refresh_quick_mode_buttons()
 
     # ------------------------------------------------------------------
     # 首页：文本区
@@ -1236,13 +1331,19 @@ class MainWindow:
         self._start_quick_conversion(Path(wav_path))
 
     def _start_quick_conversion(self, audio_path: Path) -> None:
-        """后台执行「转写 + DeepSeek 口述校对」，不写文件。"""
+        """后台执行「转写 + DeepSeek 整理」，不写文件。"""
         refine = self.settings.has_api_key
+        mode_key = getattr(self, "_quick_mode", "direct")
+        if mode_key not in QUICK_MODES:
+            mode_key = "direct"
+        mode_config = QUICK_MODES[mode_key]
+        self._quick_mode_key = mode_key
         job = JobOptions(
             refine=refine,
-            style=QUICK_STYLE,
+            style=mode_config["style"],
             language=self.settings.language,
             export_formats=[],
+            reasoning_effort=mode_config["reasoning_effort"],
         )
         self._quick_state = "converting"
         self._quick_seq += 1
@@ -1371,7 +1472,12 @@ class MainWindow:
             self._set_status("语音输入：已转写，正在本地整理…")
         self._quick_stage_label = stage_label
         self._set_home_status(stage_label)
-        self._set_home_meta("已转写 · 正在润色…" if self._quick_has_key else "已转写 · 本地整理…")
+        mode_label = QUICK_MODES.get(
+            getattr(self, "_quick_mode_key", "direct"), QUICK_MODES["direct"]
+        )["label"]
+        self._set_home_meta(
+            f"{mode_label} · {'已转写 · 正在润色…' if self._quick_has_key else '已转写 · 本地整理…'}"
+        )
         self._draw_home_converting()
 
     def _on_quick_done(self, result: JobResult) -> None:
@@ -1391,8 +1497,11 @@ class MainWindow:
         # 结果元信息只保留在结果区右上角一处；录音区恢复「按 Alt+~」提示，底部状态栏保持干净
         self._set_home_status(HOME_IDLE_HINT)
         self._set_status("就绪")
+        mode_label = QUICK_MODES.get(
+            getattr(self, "_quick_mode_key", "direct"), QUICK_MODES["direct"]
+        )["label"]
         meta = (
-            f"{'AI 已整理' if refined else '仅本地转写'} · 用时 "
+            f"{mode_label} · {'AI 已整理' if refined else '仅本地转写'} · 用时 "
             f"{elapsed:.1f} 秒 · {chars} 字"
         )
         if copied:
@@ -1589,6 +1698,7 @@ class MainWindow:
             )
             self._set_options_enabled(quick_idle and not self._processing)
             self._sync_home_text_buttons()
+            self._refresh_quick_mode_buttons()
         except (tk.TclError, AttributeError):  # pragma: no cover - 构建期调用
             return
         self._refresh_tray()
@@ -2008,6 +2118,7 @@ class MainWindow:
             self.output_dir_var.set(self.settings.output_dir.strip() or default_out)
         finally:
             self._syncing_options = False
+        self._sync_quick_mode_from_settings(refresh=False)
         self._refresh_action_states()
         self._sync_home_text_buttons()
 
