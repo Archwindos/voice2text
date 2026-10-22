@@ -131,7 +131,15 @@ else {
     }
 }
 
-# ---------------------------------------------------------------- 5. shortcut
+# ---------------------------------------------------------------- 5. launcher
+Step "Silent launcher (no console window)"
+$buildLauncher = Join-Path $Root "tools\build_launcher.ps1"
+if (Test-Path $buildLauncher) {
+    try { & $buildLauncher | Out-Host }
+    catch { Write-Host "Could not build VoxScribe.exe; run.vbs fallback will be used." -ForegroundColor Yellow }
+}
+
+# ---------------------------------------------------------------- 6. shortcut
 Step "Desktop shortcut"
 try {
     & (Join-Path $Root "tools\create_shortcut.ps1")

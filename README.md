@@ -57,7 +57,7 @@ DeepSeek 官方 API 目前**只提供文本模型**（`deepseek-chat`、`deepsee
 
 ### 🖥️ 无黑框 + 托盘常驻
 
-- 双击桌面 **「语声成文 VoxScribe」快捷方式**（或 `run.vbs`）启动：只显示软件窗口，**不出现黑色命令行窗口**；桌面图标由 `setup.bat` 自动创建，误删后可运行 `tools\create_shortcut.ps1` 重建；
+- 双击桌面 **「语声成文 VoxScribe」快捷方式**启动：只显示软件窗口，**不出现黑色命令行窗口**；快捷方式指向项目自带的 `VoxScribe.exe` 无黑框启动器（Windows GUI 子系统，即使系统默认终端是 Windows Terminal 也不会弹控制台）；桌面图标由 `setup.bat` 自动创建，误删后可运行 `tools\create_shortcut.ps1` 重建；
 - 关闭窗口 / 最小化 → **隐藏到桌面右下角系统托盘待机**（首次会气泡提示）；
 - 托盘图标右键菜单：显示主界面、开始/停止录音（Alt+~）、退出；
 - 双击托盘图标恢复主界面；退出请用托盘菜单「退出」。
@@ -263,7 +263,7 @@ DeepSeek 官方 API 目前**只提供文本模型**（`deepseek-chat`、`deepsee
 如果 Windows 关闭了通知，首次隐藏的提示气泡不会显示，不影响功能。
 
 **5. 为什么没有黑色命令行窗口了？**
-请用 **`run.vbs`** 启动（无黑框）。即使误用 `python.exe` 等方式启动，程序也会在启动后自动隐藏控制台窗口。
+请用桌面 **「语声成文 VoxScribe」快捷方式**启动（或项目里的 `VoxScribe.exe`）。启动器是 Windows GUI 程序，从源头就不会创建控制台窗口；即使误用 `python.exe` 等方式启动，程序也会尽量隐藏控制台。
 需要看报错/调试时，用 `debug-run.bat`（会保留控制台并输出日志）。
 
 **6. 模型下载失败 / 一直卡住？**
@@ -315,7 +315,8 @@ v1.3.1 起默认语言为「自动检测」：英文语音会输出英文，不�
 voice2text/
 ├─ setup.bat               一键安装（依赖 + CUDA + 模型 + 桌面快捷方式）
 ├─ assets/voxscribe.ico    应用/快捷方式图标
-├─ run.vbs                 无黑框启动（推荐双击这个）
+├─ VoxScribe.exe           无黑框启动器（桌面快捷方式指向它）
+├─ run.vbs                 启动脚本（备用/旧入口）
 ├─ debug-run.bat           调试启动（保留控制台 + 日志）
 ├─ diagnose.bat            环境自检
 ├─ requirements.txt
@@ -339,7 +340,8 @@ voice2text/
 │     ├─ dialogs.py        设置/帮助/首次引导
 │     └─ theme.py          配色与样式
 ├─ tests/                  自动化测试（pytest，默认隐藏运行不弹窗）
-├─ tools/                  安装/下载/快捷方式/图标辅助脚本
+├─ launcher/                无黑框启动器 C# 源码（VoxScribe.exe）
+├─ tools/                  安装/下载/快捷方式/图标/启动器构建脚本
 ├─ data/                   配置、模型、录音、日志（运行时生成）
 └─ outputs/                默认输出目录
 ```
