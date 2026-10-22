@@ -142,6 +142,8 @@ class RefineOptions:
     chunk_overlap_chars: int = 120
     #: DeepSeek 思考强度：none / low / medium / high ...（空 = 用 refiner 默认值）
     reasoning_effort: str = ""
+    #: 中文输出字形：simplified / traditional / preserve（空 = 用 refiner 默认简体）
+    chinese_script: str = ""
 
 
 @dataclass

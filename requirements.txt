@@ -6,6 +6,8 @@ sounddevice>=0.4.6
 tkinterdnd2>=0.4.2
 pystray>=0.19.5
 Pillow>=10.4.0
+# 中文简繁统一（OpenCC，约 1MB）
+opencc-python-reimplemented>=0.1.7
 # GPU 转写（NVIDIA CUDA 12 + cuDNN 9，ctranslate2 运行时需要，约 1GB）
 nvidia-cublas-cu12>=12.4.5
 nvidia-cudnn-cu12>=9.1.0

@@ -455,12 +455,45 @@ def test_settings_model_shared_with_file_page(gui_env):
             theme=window.theme,
         )
         dialog.model_var.set(ASR_MODELS["base"])
+        dialog.script_var.set("繁体中文")
+        dialog.auto_learn_var.set(False)
         dialog._on_save()
         root.update()
         assert window.settings.asr_model == "base"
+        assert window.settings.chinese_script == "traditional"
+        assert window.settings.auto_glossary_learn is False
         # 文件转写页的模型下拉在设置保存后同步为同一个值
         window._apply_settings_to_ui()
         assert window._current_model_key() == "base"
+    finally:
+        _close_window(window)
+
+
+def test_direct_mode_edit_learns_glossary(gui_env):
+    """直出模式下用户把「阴轨」改成「音轨」，第二次出现自动生效。"""
+    from voxscribe import glossary as glossary_module
+
+    root, window = _make_window(gui_env, api_key="sk-test-home")
+    try:
+        def simulate_edit(original: str, edited: str) -> None:
+            window._quick_mode_key = "direct"
+            window._set_home_text(original)
+            window._set_learning_baseline(original, "direct")
+            window._set_home_text(edited)
+            window._run_glossary_learning()
+
+        simulate_edit("我们打开阴轨看看", "我们打开音轨看看")
+        entries = glossary_module.load_store()
+        candidate = [e for e in entries if e.wrong == "阴轨"]
+        assert candidate, entries
+        assert candidate[0].correct == "音轨"
+        assert candidate[0].enabled is False  # 第一次待确认
+
+        simulate_edit("这个阴轨太响了", "这个音轨太响了")
+        entries = glossary_module.load_store()
+        candidate = [e for e in entries if e.wrong == "阴轨"]
+        assert candidate and candidate[0].enabled is True  # 第二次自动生效
+        assert window.pipeline._glossary_entries
     finally:
         _close_window(window)
 

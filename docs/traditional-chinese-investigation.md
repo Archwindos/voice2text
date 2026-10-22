@@ -1,5 +1,7 @@
 # 调查：语音转写/润色结果繁简不一致
 
+> 状态：**已实现（v1.6.0）**。新增 `voxscribe/script_normalize.py`（OpenCC）+ 设置「中文输出」（默认简体/繁体/保持原文）；ASR 原文与最终稿都会转换；prompt 增加简繁硬性规则。实现后的实测：默认简体的 4 条历史繁体录音，原始转写和最终稿繁体字数均为 0；`preserve` 模式保留原文。
+>
 > 调查日期：2026-10-23 · 机型：RTX 5060 Laptop + Intel Core Ultra 7 255HX · 模型：faster-whisper medium（CUDA float16）+ DeepSeek `deepseek-flash`
 
 ## 一、结论摘要（按影响排序）

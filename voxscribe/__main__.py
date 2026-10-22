@@ -43,6 +43,28 @@ def _force_utf8_console() -> None:
             pass
 
 
+def _attach_glossary_log_handler(logs: Path) -> None:
+    """词语学习单独写 JSONL 日志（产品试验/后续优化用，不混在 app.log）。"""
+    logger = logging.getLogger("voxscribe.glossary")
+    target = (logs / "glossary_learn.jsonl").resolve()
+    for handler in logger.handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            try:
+                if Path(handler.baseFilename).resolve() == target:
+                    return
+            except Exception:  # pragma: no cover
+                continue
+    handler = logging.handlers.RotatingFileHandler(
+        target, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    # 单独落盘，避免和 app.log 重复；需要看整体流程日志时仍可查 app.log
+    logger.propagate = False
+
+
 def setup_logging(verbose: bool = False) -> Path:
     logs = logs_dir()
     log_file = logs / "app.log"
@@ -62,6 +84,7 @@ def setup_logging(verbose: bool = False) -> Path:
         console.setFormatter(formatter)
         console.setLevel(logging.DEBUG if verbose else logging.WARNING)
         root.addHandler(console)
+    _attach_glossary_log_handler(logs)
     return log_file
 
 

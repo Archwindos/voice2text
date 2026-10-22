@@ -45,6 +45,7 @@ from ..config import (
     default_output_dir,
     recordings_dir,
 )
+from .. import glossary as glossary_module
 from ..errors import CancelledError, VoxError
 from ..models import (
     EXPORT_FORMATS,
@@ -227,6 +228,9 @@ class MainWindow:
         self.settings = settings
         self.theme: Theme = theme_module.apply_theme(root)
         self.pipeline = Pipeline(settings)
+        # 已学习词语表（data/glossary.json）；启动时加载并注入 pipeline
+        self._glossary_entries: List[glossary_module.GlossaryEntry] = []
+        self._load_glossary_entries()
 
         # ---- 页面 ----
         self._page = "home"
@@ -262,6 +266,10 @@ class MainWindow:
         self._wave_job: Optional[str] = None
         self._wave_phase = 0
         self._home_placeholder = True
+        # ---- 直出模式的词语自动学习状态 ----
+        self._learn_baseline_text = ""
+        self._learn_baseline_mode = ""
+        self._learn_after_id: Optional[str] = None
 
         # ---- 通用 ----
         self._closing = False
@@ -856,6 +864,7 @@ class MainWindow:
         self.home_text.tag_configure("placeholder", foreground=colors["faint"])
         self.home_text.bind("<FocusIn>", self._on_home_text_focus_in)
         self.home_text.bind("<FocusOut>", self._on_home_text_focus_out)
+        self.home_text.bind("<KeyRelease>", self._schedule_glossary_learning)
         self.home_text.bind("<Control-Return>", self._on_home_copy_shortcut)
 
         self._show_home_placeholder()
@@ -956,6 +965,134 @@ class MainWindow:
     def _on_home_text_focus_out(self, _event: Any = None) -> None:
         if not self._home_placeholder and not self.home_text.get("1.0", "end-1c").strip():
             self._show_home_placeholder()
+        self._schedule_glossary_learning()
+
+    # ------------------------------------------------------------------
+    # 首页：直出模式的词语自动学习
+    # ------------------------------------------------------------------
+    def _load_glossary_entries(self) -> None:
+        try:
+            self._glossary_entries = glossary_module.load_store()
+        except Exception:  # pragma: no cover - 存储异常不应影响启动
+            log.exception("加载词语表失败")
+            self._glossary_entries = []
+        try:
+            self.pipeline.set_glossary_entries(self._glossary_entries)
+        except Exception:  # pragma: no cover
+            log.debug("注入词语表到 pipeline 失败", exc_info=True)
+
+    def _reload_glossary_entries(self) -> None:
+        """设置页管理词语表后重新加载。"""
+        self._load_glossary_entries()
+
+    def _schedule_glossary_learning(self, _event: Any = None) -> None:
+        """用户停止编辑 1.2 秒后，比较基线与修改后的文本。"""
+        if not bool(getattr(self.settings, "auto_glossary_learn", True)):
+            return
+        if self._quick_state != "idle" or self._home_placeholder:
+            return
+        if not self._learn_baseline_text:
+            return
+        if getattr(self, "_learn_baseline_mode", "") != "direct":
+            return
+        if self._learn_after_id:
+            try:
+                self.root.after_cancel(self._learn_after_id)
+            except tk.TclError:  # pragma: no cover
+                pass
+        self._learn_after_id = self.root.after(1200, self._run_glossary_learning)
+
+    def _flush_glossary_learning(self) -> None:
+        if self._learn_after_id:
+            try:
+                self.root.after_cancel(self._learn_after_id)
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._learn_after_id = None
+        self._run_glossary_learning()
+
+    def _run_glossary_learning(self) -> None:
+        self._learn_after_id = None
+        baseline = self._learn_baseline_text
+        if not baseline or self._home_placeholder:
+            return
+        if not bool(getattr(self.settings, "auto_glossary_learn", True)):
+            return
+        if getattr(self, "_learn_baseline_mode", "") != "direct":
+            return
+        current = self._get_home_text()
+        if not current or current == baseline:
+            return
+        try:
+            result = glossary_module.extract_candidates(baseline, current)
+            if not result.candidates:
+                self._learn_baseline_text = current
+                return
+            manual = glossary_module.parse_manual_glossary(self.settings.glossary)
+            entries, pending, conflicts = glossary_module.merge_candidates(
+                self._glossary_entries, result.candidates, manual_entries=manual
+            )
+            # 只持久化学习条目；手动术语表仍以 settings.glossary 为准
+            learned_entries = [
+                entry for entry in entries if entry.source == "learned"
+            ]
+            glossary_module.save_store(learned_entries)
+            self._glossary_entries = learned_entries
+            self.pipeline.set_glossary_entries(learned_entries)
+            self._learn_baseline_text = current
+            accepted = [
+                candidate
+                for candidate in result.candidates
+                if any(
+                    entry.wrong == candidate.wrong
+                    and entry.correct == candidate.correct
+                    and entry.enabled
+                    and entry.source == "learned"
+                    for entry in learned_entries
+                )
+            ]
+            pending_learned = [
+                entry
+                for entry in learned_entries
+                if not entry.enabled
+            ]
+            if accepted:
+                pairs = "、".join(
+                    f"{item.wrong}→{item.correct}" for item in accepted[:3]
+                )
+                self._set_status(f"已学习词语：{pairs}（设置 → 词语学习 可管理）")
+            elif pending_learned:
+                self._set_status(
+                    f"已记录 {len(pending_learned)} 条候选词语，待确认"
+                    "（设置 → 词语学习）"
+                )
+            if conflicts:
+                log.warning("词语学习出现 %d 条冲突，已进入设置页冲突区", len(conflicts))
+            log.info(
+                "词语学习完成：抽取=%d 采纳=%d 待确认=%d 冲突=%d",
+                len(result.candidates),
+                len(accepted),
+                len(pending_learned),
+                len(conflicts),
+            )
+        except Exception:  # pragma: no cover - 学习失败不应影响主流程
+            log.exception("词语自动学习失败")
+
+    def _reset_glossary_learning(self) -> None:
+        if self._learn_after_id:
+            try:
+                self.root.after_cancel(self._learn_after_id)
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._learn_after_id = None
+        self._learn_baseline_text = ""
+        self._learn_baseline_mode = ""
+
+    def _set_learning_baseline(self, text: str, mode: str) -> None:
+        """转换完成后记录基线；只有用户手动修改才会触发学习。"""
+        self._learn_baseline_text = text if mode == "direct" else ""
+        self._learn_baseline_mode = mode if mode == "direct" else ""
+        self._learn_after_id = None
 
     def _set_home_text(self, text: str) -> None:
         self.home_text.delete("1.0", "end")
@@ -973,6 +1110,7 @@ class MainWindow:
         return self.home_text.get("1.0", "end-1c").strip()
 
     def _clear_home_text(self) -> None:
+        self._reset_glossary_learning()
         self._show_home_placeholder()
         self._set_home_meta("")
         self._set_home_status(HOME_IDLE_HINT)
@@ -980,6 +1118,8 @@ class MainWindow:
         self._sync_home_text_buttons()
 
     def _copy_home_text(self, *, silent: bool = False) -> bool:
+        # 复制前先结算用户对直出结果的修改（学习词语）
+        self._flush_glossary_learning()
         text = self._get_home_text()
         if not text:
             if not silent:
@@ -1241,6 +1381,9 @@ class MainWindow:
                 parent=self.root,
             )
             return
+        # 开始新录音前结算上一次直出结果的修改，避免丢失学习数据
+        self._flush_glossary_learning()
+        self._reset_glossary_learning()
         if self._recorder is None:
             messagebox.showinfo(
                 "录音不可用",
@@ -1488,6 +1631,8 @@ class MainWindow:
         refined = bool(result.refined and (result.refined.text or "").strip())
         text = (result.final_text or "").strip()
         self._set_home_text(text)
+        # 记录直出模式的最终稿基线；用户后续手动修改时再学习词语
+        self._set_learning_baseline(text, getattr(self, "_quick_mode_key", "direct"))
         elapsed = result.elapsed or self._quick_elapsed()
         chars = len(text)
         copied = False
@@ -2838,6 +2983,8 @@ class MainWindow:
 
     def _on_settings_saved(self) -> None:
         self._apply_settings_to_ui()
+        # 设置页可能增删/启停学习词条，重新加载后注入 pipeline
+        self._reload_glossary_entries()
         self._set_status("设置已保存")
         self._update_memory()
 

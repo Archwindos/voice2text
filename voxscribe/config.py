@@ -81,6 +81,7 @@ class AppSettings:
     compute_type: str = "auto"  # auto = cuda→float16 / cpu→int8
     cpu_threads: int = 0  # 仅 CPU 模式使用；0 = 自动（最多 4 线程）
     language: str = "auto"  # auto / zh / en / ja / ko；自动检测可中英混说
+    chinese_script: str = "simplified"  # simplified / traditional / preserve
     beam_size: int = 5
     vad_filter: bool = True
     model_dir: str = ""  # 空 = data/models
@@ -101,6 +102,7 @@ class AppSettings:
     default_style: str = "oral"
     export_formats: List[str] = field(default_factory=lambda: ["txt", "md"])
     glossary: str = ""
+    auto_glossary_learn: bool = True  # 直出模式下根据用户修改自动学习词语
     output_dir: str = ""  # 空 = outputs/
     auto_copy: bool = True  # 语音输入完成后自动复制到剪贴板
     quick_mode: str = "direct"  # 语音输入模式：direct / person / ai

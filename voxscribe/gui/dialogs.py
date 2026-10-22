@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -11,9 +12,11 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Callable, Optional, Tuple
 
+from .. import glossary as glossary_module
 from ..config import ASR_MODELS, AppSettings, default_output_dir
 from ..errors import VoxError
 from ..pipeline import Pipeline
+from ..script_normalize import SCRIPTS, script_label
 from .hotkey import HOTKEY_LABEL
 from .theme import (
     COLORS,
@@ -213,8 +216,7 @@ class SettingsDialog(tk.Toplevel):
         )
 
         hint = (
-            "API Key 会用 Windows DPAPI 加密后保存在本机，只有当前 Windows 用户能解密；"
-            "只有 AI 整理需要 Key，本地语音转写完全免费。"
+            "API Key 用 Windows DPAPI 加密保存在本机；本地转写免费，只有 AI 整理需要 Key。"
         )
         _card_label(
             deepseek_body, theme, hint, muted=True, wraplength=theme.px(500)
@@ -261,10 +263,6 @@ class SettingsDialog(tk.Toplevel):
             perf_body, from_=0, to=600, textvariable=self.idle_var, width=6
         ).grid(row=0, column=3, sticky="w", pady=theme.px(4))
 
-        perf_hint = (
-            "线程数 0=自动（最多4）；空闲卸载 0=常驻，>0=空闲该分钟数后释放模型。"
-        )
-
         # 识别模型（语音输入与文件转写共用这一个设置）
         self._model_keys = list(ASR_MODELS)
         self._model_values = [ASR_MODELS[key] for key in self._model_keys]
@@ -309,11 +307,25 @@ class SettingsDialog(tk.Toplevel):
             textvariable=self.mic_var,
             values=mic_values,
             state="readonly",
-            width=40,
+            width=26,
         )
         self.mic_combo.grid(
-            row=2, column=1, columnspan=3, sticky="w", pady=(theme.px(8), 0)
+            row=2, column=1, sticky="w", pady=(theme.px(8), 0)
         )
+
+        # 中文输出字形（统一 ASR/DeepSeek 输出的简繁）
+        self.script_var = tk.StringVar()
+        _card_label(perf_body, theme, "中文输出").grid(
+            row=2, column=2, sticky="w", padx=(theme.px(18), theme.px(8)), pady=(theme.px(8), 0)
+        )
+        self.script_combo = ttk.Combobox(
+            perf_body,
+            textvariable=self.script_var,
+            values=list(SCRIPTS.values()),
+            state="readonly",
+            width=12,
+        )
+        self.script_combo.grid(row=2, column=3, sticky="w", pady=(theme.px(8), 0))
 
         # 语音输入行为（收纳进「识别与性能」卡片，减少界面区块）
         self.auto_copy_var = tk.BooleanVar(
@@ -334,16 +346,13 @@ class SettingsDialog(tk.Toplevel):
             variable=self.close_to_tray_var,
             style="Card.TCheckbutton",
         ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(theme.px(8), 0))
-        _card_label(
-            perf_body, theme, perf_hint, muted=True, wraplength=theme.px(520)
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(theme.px(6), 0))
 
         # --- 术语表 ---
         glossary_card, glossary_body = make_card(outer, theme, "术语表（可选）")
         glossary_card.pack(fill="x", pady=(0, theme.px(8)))
         self.glossary_text = tk.Text(
             glossary_body,
-            height=2,
+            height=1,
             wrap="word",
             font=theme.font(UI_SIZE),
             bg=COLORS["input_bg"],
@@ -365,6 +374,21 @@ class SettingsDialog(tk.Toplevel):
             muted=True,
             wraplength=theme.px(500),
         ).pack(anchor="w", pady=(theme.px(4), 0))
+
+        learn_row = tk.Frame(glossary_body, bg=COLORS["card"])
+        learn_row.pack(fill="x", pady=(theme.px(6), 0))
+        self.auto_learn_var = tk.BooleanVar(
+            value=bool(getattr(self.settings, "auto_glossary_learn", True))
+        )
+        ttk.Checkbutton(
+            learn_row,
+            text="直出模式下自动学习我的修改",
+            variable=self.auto_learn_var,
+            style="Card.TCheckbutton",
+        ).pack(side="left")
+        ttk.Button(
+            learn_row, text="管理词语表…", command=self._open_glossary_manager
+        ).pack(side="right")
 
         # --- 默认输出 ---
         output_card, output_body = make_card(outer, theme, "默认输出目录")
@@ -422,6 +446,8 @@ class SettingsDialog(tk.Toplevel):
         self.model_var.set(
             ASR_MODELS.get(settings.asr_model, ASR_MODELS.get("medium", ""))
         )
+        self.script_var.set(script_label(settings.chinese_script))
+        self.auto_learn_var.set(bool(getattr(settings, "auto_glossary_learn", True)))
         self.threads_var.set(str(int(settings.cpu_threads or 0)))
         self.idle_var.set(str(int(settings.idle_unload_minutes or 0)))
         self.output_var.set(
@@ -493,6 +519,14 @@ class SettingsDialog(tk.Toplevel):
         )
         if chosen:
             self.output_var.set(chosen)
+
+    def _open_glossary_manager(self) -> None:
+        """打开「词语学习」管理窗口（增删/启停学习词条）。"""
+        try:
+            GlossaryManagerDialog(self, self.theme).show()
+        except Exception:  # pragma: no cover - 管理窗口异常不应影响设置
+            log.exception("打开词语学习管理窗口失败")
+            messagebox.showerror("打开失败", "无法打开词语表管理窗口。", parent=self)
 
     # -- 测试连接（后台线程） ----------------------------------------
     def _on_test_connection(self) -> None:
@@ -634,12 +668,19 @@ class SettingsDialog(tk.Toplevel):
         self.settings.idle_unload_minutes = idle_minutes
         self.settings.close_to_tray = bool(self.close_to_tray_var.get())
         self.settings.auto_copy = bool(self.auto_copy_var.get())
+        self.settings.auto_glossary_learn = bool(self.auto_learn_var.get())
         self.settings.glossary = self.glossary_text.get("1.0", "end-1c").strip()
         # 识别模型：语音输入与文件转写共用这一个设置
         model_choice = self.model_var.get().strip()
         for key, label in ASR_MODELS.items():
             if label == model_choice:
                 self.settings.asr_model = key
+                break
+        # 中文输出字形：统一 ASR / DeepSeek 的简繁
+        script_choice = self.script_var.get().strip()
+        for key, label in SCRIPTS.items():
+            if label == script_choice:
+                self.settings.chinese_script = key
                 break
         mic_choice = self.mic_var.get().strip()
         self.settings.input_device = (
@@ -846,6 +887,171 @@ class WelcomeDialog(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
+# 词语学习管理
+# ---------------------------------------------------------------------------
+class GlossaryManagerDialog(tk.Toplevel):
+    """查看/启停/删除自动学习到的词语。"""
+
+    def __init__(self, parent: tk.Misc, theme: Theme) -> None:
+        super().__init__(parent)
+        self.theme = theme
+        self.title("词语学习 · 语声成文 VoxScribe")
+        self.configure(bg=COLORS["bg"])
+        self.transient(parent)
+        self.resizable(False, False)
+        self._entries = glossary_module.load_store()
+
+        outer = tk.Frame(self, bg=COLORS["bg"])
+        outer.pack(fill="both", expand=True, padx=theme.px(16), pady=theme.px(14))
+
+        tk.Label(
+            outer,
+            text="自动学习到的词语",
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            font=theme.font(UI_SIZE, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            outer,
+            text=(
+                "在「直出」模式下修改转写结果后自动提取；同一错误出现第 2 次会自动生效。"
+                "待确认的词条需要手动启用。"
+            ),
+            bg=COLORS["bg"],
+            fg=COLORS["muted"],
+            font=theme.font(SMALL_SIZE),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(520),
+        ).pack(fill="x", pady=(theme.px(4), theme.px(8)))
+
+        list_frame = tk.Frame(outer, bg=COLORS["card"])
+        list_frame.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(
+            list_frame,
+            height=10,
+            font=theme.font(UI_SIZE),
+            bg=COLORS["input_bg"],
+            fg=COLORS["text"],
+            selectbackground=COLORS["selection"],
+            selectforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            activestyle="none",
+        )
+        scroll = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.listbox.yview
+        )
+        self.listbox.configure(yscrollcommand=scroll.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        buttons = tk.Frame(outer, bg=COLORS["bg"])
+        buttons.pack(fill="x", pady=(theme.px(10), 0))
+        ttk.Button(
+            buttons, text="启用 / 停用选中", command=self._toggle_selected
+        ).pack(side="left")
+        ttk.Button(buttons, text="删除选中", command=self._delete_selected).pack(
+            side="left", padx=(theme.px(8), 0)
+        )
+        ttk.Button(buttons, text="清空学习记录", command=self._clear_all).pack(
+            side="left", padx=(theme.px(8), 0)
+        )
+        ttk.Button(buttons, text="关闭", command=self.destroy).pack(side="right")
+
+        self._refresh()
+        self.update_idletasks()
+        center_window(self, theme.px(620), theme.px(430))
+
+    def _refresh(self) -> None:
+        self.listbox.delete(0, "end")
+        for entry in self._entries:
+            if entry.kind == "delete":
+                action = f"删除「{entry.wrong}」"
+            else:
+                action = f"{entry.wrong} → {entry.correct}"
+            status = "✓" if entry.enabled else "待确认"
+            self.listbox.insert(
+                "end", f"[{status}] {action} · 第 {entry.count} 次"
+            )
+
+    def _selected(self) -> list[int]:
+        return list(self.listbox.curselection())
+
+    def _save(self) -> None:
+        glossary_module.save_store(self._entries)
+        self._refresh()
+
+    def _log_ui_event(self, event: str, entries: list, action: str = "") -> None:
+        """把用户对学习词条的确认/删除也写入 JSONL 试验日志。"""
+        if not entries:
+            return
+        payload = {
+            "event": event,
+            "action": action,
+            "entries": [
+                {
+                    "wrong": item.wrong,
+                    "correct": item.correct,
+                    "kind": item.kind,
+                    "enabled": item.enabled,
+                    "count": item.count,
+                }
+                for item in entries
+            ],
+        }
+        try:
+            logging.getLogger("voxscribe.glossary").info(
+                json.dumps(payload, ensure_ascii=False)
+            )
+        except Exception:  # pragma: no cover - 日志失败不影响操作
+            pass
+
+    def _toggle_selected(self) -> None:
+        selected = self._selected()
+        changed = []
+        for index in selected:
+            self._entries[index].enabled = not self._entries[index].enabled
+            changed.append(self._entries[index])
+        self._log_ui_event("ui_toggle", changed, "enable" if changed and changed[0].enabled else "disable")
+        self._save()
+
+    def _delete_selected(self) -> None:
+        selected = self._selected()
+        if not selected:
+            return
+        removed = []
+        for index in sorted(selected, reverse=True):
+            if 0 <= index < len(self._entries):
+                removed.append(self._entries.pop(index))
+        self._log_ui_event("ui_delete", list(reversed(removed)))
+        self._save()
+
+    def _clear_all(self) -> None:
+        if not self._entries:
+            return
+        if not messagebox.askyesno(
+            "清空词语表", "确定清空所有自动学习的词语吗？此操作不可撤销。", parent=self
+        ):
+            return
+        removed = list(self._entries)
+        self._entries = []
+        self._log_ui_event("ui_clear", removed)
+        glossary_module.save_store(self._entries)
+        self._refresh()
+
+    def show(self) -> None:
+        try:
+            self.grab_set()
+            self.wait_window()
+        except tk.TclError:  # pragma: no cover - 主窗口已销毁
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 帮助
 # ---------------------------------------------------------------------------
 _HELP_TEXT = f"""语音输入：说一句，立刻成文（推荐）
@@ -891,7 +1097,12 @@ _HELP_TEXT = f"""语音输入：说一句，立刻成文（推荐）
 · API Key 安全：使用 Windows DPAPI 加密保存在本机，只有当前 Windows 用户能解密；设置里留空保存不会清掉已保存的 Key。
 · 空闲卸载模型：默认 0（常驻不卸载，保证口述速度）；如需节省内存可在设置中改为指定分钟数。
 · CPU 占用可控：默认最多使用 4 个线程，避免占满电脑资源。
-· 数据都在本地：配置在 data/config.json，录音在 data/recordings，日志在 data/logs/app.log。
+· 中文简繁统一：默认输出简体；可在 设置 → 识别与性能 →「中文输出」改为繁体或保持原文，
+  ASR 原文和最终稿都会统一转换，不再时繁时简。
+· 词语自动学习：在「直出」模式修改结果后自动提取「错词 → 正确词」，同一错误第 2 次出现自动生效；
+  在 设置 → 术语表 →「管理词语表…」查看/启停/删除，学习日志在 data/logs/glossary_learn.jsonl。
+· 数据都在本地：配置在 data/config.json，录音在 data/recordings，日志在 data/logs/app.log，
+  词语学习记录在 data/glossary.json。
 
 小提示
 

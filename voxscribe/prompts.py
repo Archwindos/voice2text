@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Dict
 
+from .script_normalize import script_rule
+
 # ---------------------------------------------------------------------------
 # user prompt 分区标记（测试工具也依赖这些常量）
 # ---------------------------------------------------------------------------
@@ -194,9 +196,20 @@ CONNECTION_USER_PROMPT = "只回复：连接成功"
 CONNECTION_MAX_TOKENS = 32
 
 
-def language_name(language: str) -> str:
-    """把语言代码映射成 prompt 里使用的中文名称。"""
+def language_name(language: str, chinese_script: str = "simplified") -> str:
+    """把语言代码映射成 prompt 里使用的中文名称（中文区分简繁设置）。"""
     key = (language or "").strip().lower()
+    if key in ("zh", "cn"):
+        script = (
+            "traditional"
+            if str(chinese_script or "").strip().lower() == "traditional"
+            else str(chinese_script or "").strip().lower()
+        )
+        if script == "traditional":
+            return "繁体中文"
+        if script == "preserve":
+            return "中文（保持原文简繁）"
+        return "简体中文"
     return LANGUAGE_NAMES.get(key, "与原文相同的语言")
 
 
@@ -206,15 +219,23 @@ def style_key(style: str) -> str:
     return key if key in STYLE_PROMPTS else "oral"
 
 
-def common_rules(language: str = "zh") -> str:
-    """通用约束（所有风格共用）。"""
-    return _COMMON_RULES.format(language=language_name(language))
+def common_rules(language: str = "zh", chinese_script: str = "simplified") -> str:
+    """通用约束（所有风格共用）；中文附带简繁硬性规则。"""
+    rules = _COMMON_RULES.format(
+        language=language_name(language, chinese_script=chinese_script)
+    )
+    rule = script_rule(language, chinese_script)
+    if rule:
+        rules += f"7. {rule}\n"
+    return rules
 
 
-def system_prompt(style: str, language: str = "zh") -> str:
+def system_prompt(
+    style: str, language: str = "zh", chinese_script: str = "simplified"
+) -> str:
     """拼装指定风格的 system prompt。"""
     body = STYLE_PROMPTS[style_key(style)].strip()
-    return f"{body}\n\n{common_rules(language)}"
+    return f"{body}\n\n{common_rules(language, chinese_script)}"
 
 
 def user_prompt(

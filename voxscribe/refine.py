@@ -285,6 +285,7 @@ class DeepSeekRefiner:
         timeout: float = 120.0,
         max_retries: int = 2,
         reasoning_effort: str = "none",
+        chinese_script: str = "simplified",
     ) -> None:
         self._api_key = (api_key or "").strip()
         self.base_url = normalize_base_url(base_url)
@@ -292,6 +293,9 @@ class DeepSeekRefiner:
         self.model = (model or "deepseek-flash").strip() or "deepseek-flash"
         # 默认思考强度：none（不思考）/ low / medium / high ...
         self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        self.chinese_script = (
+            str(chinese_script or "").strip().lower() or "simplified"
+        )
 
         timeout_value = _safe_float(timeout, 120.0)
         if timeout_value <= 0:
@@ -353,7 +357,9 @@ class DeepSeekRefiner:
             log.warning("转写内容为空，跳过 DeepSeek 整理")
             return RefineResult(text="", chunks=0, elapsed=time.monotonic() - started)
 
-        system = prompts.system_prompt(style, language)
+        system = prompts.system_prompt(
+            style, language, options.chinese_script or self.chinese_script
+        )
         usage = RefineUsage()
         parts: List[str] = []
         log.info(

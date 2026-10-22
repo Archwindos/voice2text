@@ -24,6 +24,14 @@ from .config import AppSettings
 from .export import export_result
 from .models import JobEvent, JobOptions, JobResult, RefineOptions, RefineResult, Transcript
 from .refine import DeepSeekRefiner
+from . import glossary as glossary_module
+from .script_normalize import (
+    convert_script,
+    count_script_changes,
+    is_chinese_language,
+    normalize_script_name,
+    script_label,
+)
 from .util import human_duration, sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -51,6 +59,7 @@ def _default_refiner_factory(settings: AppSettings, api_key: str) -> DeepSeekRef
         timeout=settings.api_timeout,
         max_retries=settings.api_max_retries,
         reasoning_effort=settings.api_reasoning_effort,
+        chinese_script=settings.chinese_script,
     )
 
 
@@ -63,6 +72,7 @@ class Pipeline:
         *,
         asr_factory: Optional[Callable[[AppSettings], WhisperASR]] = None,
         refiner_factory: Optional[Callable[[AppSettings, str], DeepSeekRefiner]] = None,
+        glossary_entries: Optional[List[glossary_module.GlossaryEntry]] = None,
     ) -> None:
         self.settings = settings
         self._asr_factory = asr_factory or _default_asr_factory
@@ -71,9 +81,34 @@ class Pipeline:
         self._asr_signature: Optional[tuple] = None
         self._refiner: Optional[DeepSeekRefiner] = None
         self._refiner_signature: Optional[tuple] = None
+        self._glossary_entries = list(glossary_entries or [])
         self._last_activity: float = time.monotonic()
         self._busy = False
         self._guard = threading.RLock()
+
+    def set_glossary_entries(
+        self, entries: Optional[List[glossary_module.GlossaryEntry]]
+    ) -> None:
+        """更新已学习词语表（界面学习/确认/删除后调用）。"""
+        with self._guard:
+            self._glossary_entries = list(entries or [])
+
+    def _effective_glossary_entries(self) -> List[glossary_module.GlossaryEntry]:
+        """手动术语表优先 + 已学习条目（同 wrong 时手动覆盖学习）。"""
+        manual = glossary_module.parse_manual_glossary(self.settings.glossary)
+        manual_wrong = {entry.wrong for entry in manual if entry.wrong}
+        learned = [
+            entry
+            for entry in self._glossary_entries
+            if entry.wrong not in manual_wrong
+        ]
+        return list(manual) + learned
+
+    def _glossary_prompt_text(self) -> str:
+        """发给 DeepSeek 的术语表：保留手动原文，再追加学习条目。"""
+        manual_text = (self.settings.glossary or "").strip()
+        learned_text = glossary_module.build_prompt_glossary(self._glossary_entries)
+        return "\n".join(part for part in (manual_text, learned_text) if part)
 
     # ------------------------------------------------------------------
     # 设置
@@ -209,6 +244,15 @@ class Pipeline:
                 "没有识别到有效语音内容",
                 hint="请确认音频中有清晰的人声，或换用更大的识别模型（设置 → 识别模型）。",
             )
+        # 中文简繁统一：在显示/整理之前就把 ASR 原文转成用户选择的字形
+        self._normalize_transcript_script(transcript)
+        # 本地应用手动 + 自动学习的词语表（在显示原文和 DeepSeek 之前）
+        glossary_entries = self._effective_glossary_entries()
+        if glossary_entries:
+            for segment in transcript.segments:
+                segment.text = glossary_module.apply_replacements(
+                    segment.text, glossary_entries
+                )
         if cancel.is_set():
             raise errors.CancelledError("任务已取消")
 
@@ -238,8 +282,9 @@ class Pipeline:
                     if job.language not in (None, "", "auto")
                     else (transcript.language or "zh")
                 ),
-                glossary=self.settings.glossary,
+                glossary=self._glossary_prompt_text(),
                 reasoning_effort=job.reasoning_effort or "",
+                chinese_script=self.settings.chinese_script,
             )
 
             def on_refine_progress(ratio: float, message: str) -> None:
@@ -262,10 +307,50 @@ class Pipeline:
                     "DeepSeek 返回了空结果",
                     hint="可以关闭「AI 整理」后重试，或稍后再试。",
                 )
+            # 最终稿再统一一次字形，避免模型把繁体/简体改回去
+            refined.text = self._normalize_refined_script(
+                refined.text, transcript.language
+            )
+            if glossary_entries:
+                refined.text = glossary_module.apply_replacements(
+                    refined.text, glossary_entries
+                )
             if cancel.is_set():
                 raise errors.CancelledError("任务已取消")
 
         return JobResult(audio_path=str(audio), transcript=transcript, refined=refined)
+
+    def _normalize_transcript_script(self, transcript: Transcript) -> None:
+        """把 ASR 原始转写统一成设置里的中文字形（默认简体）。"""
+        script = normalize_script_name(self.settings.chinese_script)
+        if script == "preserve" or not is_chinese_language(transcript.language):
+            return
+        changed = 0
+        for segment in transcript.segments:
+            count = count_script_changes(segment.text, script)
+            if count:
+                segment.text = convert_script(segment.text, script)
+                changed += count
+        if changed:
+            log.info(
+                "中文简繁统一（ASR 原文）：%d 个字 -> %s",
+                changed,
+                script_label(script),
+            )
+
+    def _normalize_refined_script(self, text: str, language: str) -> str:
+        """最终稿再统一一次字形，避免模型把简繁改回去。"""
+        script = normalize_script_name(self.settings.chinese_script)
+        if script == "preserve" or not is_chinese_language(language):
+            return text
+        changed = count_script_changes(text, script)
+        if changed:
+            log.info(
+                "中文简繁统一（最终稿）：%d 个字 -> %s",
+                changed,
+                script_label(script),
+            )
+        return convert_script(text, script)
 
     # ------------------------------------------------------------------
     # 公共入口

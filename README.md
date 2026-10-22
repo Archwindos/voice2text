@@ -52,6 +52,8 @@ DeepSeek 官方 API 提供文本模型（当前为 `deepseek-flash`（V4.1 Flash
   - **直出**：只做最低限度的错别字/同音字纠错，保留你的原话、语序和语气（`reasoning_effort=none`，最快）；
   - **对人**：整理成一条可以直接发给同事/客户的正式聊天消息，礼貌自然、不写成邮件（`reasoning_effort=low`）；
   - **对AI**：整理成结构清晰、可直接发给 AI 的提示词/命令，保留约束与输出要求（`reasoning_effort=high`）。
+- **简繁统一**：中文输出默认统一为简体（设置 → 识别与性能 →「中文输出」可切换繁体/保持原文）。ASR 原文和 DeepSeek 最终稿都会做一次确定性转换，不再出现「同一段话有时繁体、有时简体」。
+- **词语自动学习**（直出模式）：在结果框里把「阴轨」改成「音轨」后，系统自动提取词对并学习；同一错误第 2 次出现自动生效，可在 设置 → 术语表 →「管理词语表…」查看/启停/删除。
 - **自动复制**：设置里可开启「完成后自动复制到剪贴板」（默认开），最终稿直接到剪贴板。
 - **识别模型统一设置**：设置 → 识别与性能 →「识别模型」，语音输入和文件转写共用这一个设置，不会出现两个页面对不上的情况。
 - **麦克风可选 + 无声提醒**：设置里可以选择具体麦克风（默认系统设备）；录音 1.5 秒仍没有检测到声音会直接提示「请检查麦克风是否静音/选错设备」，不会让你对着空气说话还不知道。
@@ -77,7 +79,7 @@ DeepSeek 官方 API 提供文本模型（当前为 `deepseek-flash`（V4.1 Flash
   - **会议纪要**：结构化输出议题、结论、待办事项
   - **逐字稿润色**：保留原话，只做最小清洗
   - **要点摘要**：压缩成要点列表
-- **术语表**：人名、公司名、专业词按指定写法校正同音错字；
+- **术语表**：人名、公司名、专业词按指定写法校正同音错字；手动维护 + 从直出模式的修改中自动学习；
 - 导出 txt / Markdown / Word（docx）/ SRT 字幕，附一份带时间戳的原始转写；
 - 批量队列、进度、取消、失败跳过；重名自动加 `(2)` 不覆盖。
 
@@ -135,6 +137,8 @@ DeepSeek 官方 API 提供文本模型（当前为 `deepseek-flash`（V4.1 Flash
 | 取消录音 / 中止转换 | `Esc` |
 | 复制转换结果 | `Ctrl+Enter`（或「复制文字」按钮） |
 | 切换输出模式 | 首页顶部「模式」：直出 / 对人 / 对AI |
+| 中文简繁输出 | 设置 → 识别与性能 →「中文输出」：简体 / 繁体 / 保持原文 |
+| 查看/管理学习词语 | 设置 → 术语表 →「管理词语表…」 |
 | 自动复制开关 | 设置 → 识别与性能 →「完成后自动复制到剪贴板」 |
 | 中英混说 / 说英文 | 默认自动识别，不会翻译成中文；如异常请确认未把语言固定为中文 |
 | 从托盘恢复主界面 | 双击托盘图标，或右键 → 显示主界面 |
@@ -165,7 +169,7 @@ DeepSeek 官方 API 提供文本模型（当前为 `deepseek-flash`（V4.1 Flash
   <img src="docs/file-page.png" alt="文件转写页" width="900">
 </p>
 
-**设置**：API Key、麦克风设备、性能、术语表、输出目录。
+**设置**：API Key、麦克风设备、性能、中文输出字形、术语表/词语学习、输出目录。
 
 <p align="center">
   <img src="docs/settings.png" alt="设置对话框" width="620">
@@ -173,7 +177,7 @@ DeepSeek 官方 API 提供文本模型（当前为 `deepseek-flash`（V4.1 Flash
 
 - 顶部导航切换「语音输入 / 文件转写」；右上角「设置」「帮助」；
 - 底部状态栏：进度、当前状态（内存等诊断信息已收起，保持界面干净）；
-- 设置：API Key、Base URL / 模型名、术语表、CPU 线程数、空闲卸载、默认输出目录、麦克风设备、测试连接、关闭到托盘。
+- 设置：API Key、Base URL / 模型名、术语表与词语自动学习、CPU 线程数、空闲卸载、中文输出（简体/繁体/保持原文）、默认输出目录、麦克风设备、测试连接、关闭到托盘。
 
 ## 七、模型怎么选？
 
@@ -242,7 +246,9 @@ DeepSeek 官方 API 提供文本模型（当前为 `deepseek-flash`（V4.1 Flash
 | `refine_by_default` | 文件页默认开启 AI 整理 | `true` |
 | `default_style` | 文件页默认整理风格 | `oral` |
 | `export_formats` | 默认导出格式 | `["txt","md"]` |
-| `glossary` | 术语表 | 空 |
+| `glossary` | 手动术语表（「正确写法：常见误写」） | 空 |
+| `chinese_script` | 中文输出字形：`simplified` / `traditional` / `preserve` | `simplified` |
+| `auto_glossary_learn` | 直出模式下自动学习词语 | `true` |
 | `output_dir` | 输出目录，空=`outputs/` | 空 |
 | `auto_copy` | 语音输入完成后自动复制 | `true` |
 
@@ -337,6 +343,12 @@ v1.3.3 起桌面快捷方式使用自带的 `VoxScribe.exe` 无黑框启动器�
 | **对AI** | 把口述需求变成给 AI 的提示词 | 结构清晰的 prompt，保留目标/约束/输出要求 | `high` |
 模式会记住上次选择；录音/转换过程中不能切换。文件转写页仍使用原来的 5 种整理风格，与语音输入的三种模式相互独立。
 
+**19. 为什么以前有时输出繁体、有时简体？**
+Whisper 在自动语言模式下没有简体提示、DeepSeek 的 prompt 也没有硬性简繁规则，加上模型输出有随机性，就会时好时坏。v1.6.0 起：设置里可选「中文输出」（默认简体），ASR 原文和最终稿都会用 OpenCC 做确定性转换；prompt 也加入了简繁硬性规则。排查过程见 [docs/traditional-chinese-investigation.md](docs/traditional-chinese-investigation.md)。
+
+**20. 词语自动学习是怎么工作的？**
+只在「直出」模式下生效：以本次最终稿为基线，比较你修改后的文本，用字符级对齐提取「错词 → 正确词」；标点、繁简、整段重写、单字和含数字的片段会被过滤。首次出现进入待确认，同一错误出现第 2 次自动生效；学习记录保存在 `data/glossary.json`，详细 JSONL 试验日志在 `data/logs/glossary_learn.jsonl`。设计说明见 [docs/glossary-auto-learning-design.md](docs/glossary-auto-learning-design.md)。
+
 ## 十三、项目结构
 
 ```
@@ -350,14 +362,16 @@ voice2text/
 ├─ requirements.txt
 ├─ voxscribe/
 │  ├─ __main__.py          入口（GUI / 命令行）
-│  ├─ config.py            配置与路径（GPU/托盘/API Key 加密）
+│  ├─ config.py            配置与路径（GPU/托盘/API Key 加密/简繁设置）
 │  ├─ secure.py            Windows DPAPI 封装
 │  ├─ models.py            数据结构契约（含 5 种整理风格）
 │  ├─ errors.py            异常类型
 │  ├─ asr.py               faster-whisper GPU/CPU 转写（CUDA DLL 自动加载）
 │  ├─ recorder.py          麦克风录音 + 实时音量
 │  ├─ refine.py            DeepSeek 整理调用（分块/重试/取消）
-│  ├─ prompts.py           5 种风格的提示词（含口述校对）
+│  ├─ script_normalize.py  中文简繁统一（OpenCC）
+│  ├─ glossary.py          词语表自动学习/本地替换/存储
+│  ├─ prompts.py           整理风格 + 直出/对人/对AI 提示词
 │  ├─ pipeline.py          转写→整理→导出 流水线（支持两段式回调/预热）
 │  ├─ export.py            txt/md/docx/srt 导出
 │  ├─ util.py              小工具
@@ -370,7 +384,7 @@ voice2text/
 ├─ tests/                  自动化测试（pytest，默认隐藏运行不弹窗）
 ├─ launcher/                无黑框启动器 C# 源码（VoxScribe.exe）
 ├─ tools/                  安装/下载/快捷方式/图标/启动器构建脚本
-├─ data/                   配置、模型、录音、日志（运行时生成）
+├─ data/                   配置、模型、录音、日志、glossary.json（运行时生成）
 └─ outputs/                默认输出目录
 ```
 
