@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import logging
 import logging.handlers
 import os
@@ -227,7 +228,27 @@ def run_check() -> int:
     return 0
 
 
+def _hide_console_window() -> None:
+    """GUI 模式下隐藏控制台窗口（即使通过 python.exe/run.bat 启动也不显示黑框）。
+
+    设置环境变量 ``VOXSCRIBE_KEEP_CONSOLE=1`` 可保留控制台（调试用）。
+    """
+    if sys.platform != "win32":
+        return
+    if os.environ.get("VOXSCRIBE_KEEP_CONSOLE", "").strip() == "1":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:  # pragma: no cover - 无控制台/极端环境
+        pass
+
+
 def launch_gui() -> int:
+    _hide_console_window()
     try:
         from .gui.app import launch
     except Exception as exc:

@@ -5,6 +5,7 @@ if not exist ".venv\Scripts\python.exe" goto missing
 chcp 65001 >nul
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
+set VOXSCRIBE_KEEP_CONSOLE=1
 ".venv\Scripts\python.exe" -m voxscribe --verbose
 if errorlevel 1 (
     echo.

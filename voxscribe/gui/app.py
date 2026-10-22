@@ -1119,7 +1119,19 @@ class MainWindow:
             self._quick_start()
 
     def _on_hotkey(self) -> None:
-        """全局 Alt+~：开始/停止录音（窗口前台、最小化到托盘或隐藏时都生效）。"""
+        """全局 Alt+~：弹出主窗口，并开始/停止录音（托盘隐藏时也生效）。"""
+        if self._quitting:
+            return
+        if not self._window_visible():
+            self._show_window_from_tray()
+        else:
+            try:
+                self.root.deiconify()
+                self.root.state("normal")
+                self.root.lift()
+                self.root.focus_force()
+            except tk.TclError:  # pragma: no cover
+                pass
         self._toggle_quick()
 
     def _resolve_input_device(self) -> Optional[int]:
@@ -2985,9 +2997,11 @@ class MainWindow:
             self._show_window_from_tray()
 
     def _toggle_quick_from_tray(self) -> None:
-        """托盘菜单「开始/停止录音」：窗口隐藏时也可直接开始录音。"""
+        """托盘菜单「开始/停止录音」：先恢复窗口，再开始录音。"""
         if self._quitting:
             return
+        if not self._window_visible():
+            self._show_window_from_tray()
         self._toggle_quick()
         self._refresh_tray()
 
