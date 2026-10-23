@@ -22,7 +22,13 @@ if (-not (Test-Path $exe)) {
 }
 
 $desktop = [Environment]::GetFolderPath("Desktop")
-$shortcutPath = Join-Path $desktop "语声成文 VoxScribe.lnk"
+# 如果用户把快捷方式移到了桌面「软件」文件夹，就沿用该位置，避免重复创建
+$folderShortcut = Join-Path $desktop "软件\语声成文 VoxScribe.lnk"
+if (Test-Path $folderShortcut) {
+    $shortcutPath = $folderShortcut
+} else {
+    $shortcutPath = Join-Path $desktop "语声成文 VoxScribe.lnk"
+}
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
@@ -34,5 +40,5 @@ $shortcut.WindowStyle = 1
 $shortcut.IconLocation = "$exe,0"
 $shortcut.Save()
 
-Write-Host "已创建桌面快捷方式：$shortcutPath" -ForegroundColor Green
-Write-Host "以后双击桌面图标即可启动（无黑色命令行窗口）。"
+Write-Host "快捷方式已就绪：$shortcutPath" -ForegroundColor Green
+Write-Host "以后双击图标即可启动（无黑色命令行窗口）；重复启动只会激活已打开的窗口。"
