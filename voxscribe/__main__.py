@@ -33,6 +33,8 @@ from .config import (
 from .models import STYLES, JobEvent, JobOptions
 from .pipeline import Pipeline
 
+log = logging.getLogger(__name__)
+
 
 def _force_utf8_console() -> None:
     """避免 Windows 控制台 GBK 编码导致中文输出报错。"""
@@ -272,13 +274,38 @@ def _hide_console_window() -> None:
 
 def launch_gui() -> int:
     _hide_console_window()
+    single_instance = None
+    single_instance_disabled = (
+        os.environ.get("VOXSCRIBE_DISABLE_SINGLE_INSTANCE", "").strip() == "1"
+        or os.environ.get("VOXSCRIBE_GUI_HIDDEN", "").strip() == "1"
+    )
+    if not single_instance_disabled:
+        try:
+            from .instance import SingleInstance
+
+            single_instance = SingleInstance()
+            if not single_instance.acquire():
+                # 已有实例：请求它显示窗口，然后自己退出（不创建第二个窗口）
+                activated = single_instance.request_activation()
+                log.info("已有 VoxScribe 实例在运行，激活现有窗口=%s", activated)
+                single_instance.close()
+                return 0
+        except Exception:  # pragma: no cover - 单实例检查失败不应阻止启动
+            log.exception("单实例检查失败，继续正常启动")
+            single_instance = None
     try:
         from .gui.app import launch
     except Exception as exc:
         print(f"无法加载图形界面：{exc}", file=sys.stderr)
         print("可尝试运行 setup.bat 重新安装依赖，或用 -i 参数走命令行模式。", file=sys.stderr)
+        if single_instance is not None:
+            single_instance.close()
         return 1
-    return int(launch() or 0)
+    try:
+        return int(launch(single_instance=single_instance) or 0)
+    finally:
+        if single_instance is not None:
+            single_instance.close()
 
 
 def main(argv: Optional[List[str]] = None) -> int:

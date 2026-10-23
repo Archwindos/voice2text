@@ -3423,8 +3423,12 @@ def _create_root() -> tk.Tk:
     return root
 
 
-def launch() -> int:
-    """启动图形界面，返回进程退出码（0 = 正常退出）。"""
+def launch(single_instance: Any = None) -> int:
+    """启动图形界面，返回进程退出码（0 = 正常退出）。
+
+    ``single_instance``：主实例的 :class:`voxscribe.instance.SingleInstance`；
+    主循环会轮询它，第二个实例启动时把已有窗口拉到前台。
+    """
     theme_module.enable_dpi_awareness()
     try:
         settings = AppSettings.load()
@@ -3436,6 +3440,22 @@ def launch() -> int:
     try:
         root = _create_root()
         window = MainWindow(root, settings)
+
+        if single_instance is not None:
+            def _poll_activation() -> None:
+                try:
+                    if single_instance.consume_activation_request():
+                        log.info("收到第二个实例的激活请求，显示主窗口")
+                        window._show_window_from_tray()
+                except Exception:  # pragma: no cover - 激活失败不影响主流程
+                    log.debug("轮询单实例激活事件失败", exc_info=True)
+                try:
+                    root.after(400, _poll_activation)
+                except tk.TclError:  # pragma: no cover - 窗口销毁中
+                    pass
+
+            root.after(400, _poll_activation)
+
         return window.run()
     except Exception as exc:
         log.exception("图形界面启动失败")
