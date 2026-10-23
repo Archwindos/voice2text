@@ -5,9 +5,46 @@
 >
 > GitHub 仓库：<https://github.com/Archwindos/voice2text>
 
+## 怎么用（3 步）
+
+> **还没安装？** 下载仓库后双击 `setup.bat`，安装完成后桌面会自动生成「语声成文 VoxScribe」快捷方式。
+> **第一次用**：点右上角「设置」填 DeepSeek API Key（不填也能用，只是只做本地转写、不整理文字）。
+
+### ① 双击快捷方式，打开软件
+
 <p align="center">
-  <img src="docs/home-result.png" alt="语声成文 · 语音输入页" width="900">
+  <img src="docs/home-idle.png" alt="主界面：先选模式，再开始录音" width="780">
 </p>
+
+首页顶部先选输出模式：**直出**（原话+简单纠错）、**对人**（正式聊天消息）、**对AI**（给 AI 的提示词）。
+
+### ② 按 Alt+~ 说一段，说完再按一次
+
+在任意程序里按 **Alt+~**，软件窗口会自动弹出并开始录音；对着麦克风正常说话，再按一次 **Alt+~** 结束。
+也可以直接点窗口里的 **「● 开始录音」**。
+
+<p align="center">
+  <img src="docs/home-recording.png" alt="录音中：波形实时跳动，再按 Alt+~ 结束" width="780">
+</p>
+
+### ③ 1~2 秒出字，直接 Ctrl+V 粘贴
+
+停止录音后，约 1 秒先显示原始文字，再用 DeepSeek 整理成最终稿；**默认已自动复制**，直接去目标软件 `Ctrl+V` 即可。
+不满意可以顺手修改，再点「复制文字」或按 `Ctrl+Enter`。
+
+<p align="center">
+  <img src="docs/home-result.png" alt="转换结果：自动复制，可直接粘贴" width="780">
+</p>
+
+### 首次使用：填一下 DeepSeek API Key
+
+右上角 **设置** → 粘贴 Key → **测试连接** → 保存。没有 Key 时会自动降级为「只本地转写」，完全免费、离线。
+
+<p align="center">
+  <img src="docs/settings.png" alt="设置页：DeepSeek API Key、识别模型、中文输出、词语表" width="460">
+</p>
+
+> 长音频（会议、访谈、课程）请切到第二页 **「文件转写」**，支持批量转写和导出 txt / Word / Markdown / SRT。
 
 ---
 
