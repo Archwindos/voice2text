@@ -2,6 +2,8 @@
 
 > 说出来，就是文字。在任何程序前面按 **Alt+~** 说一段话，再按一次，1~2 秒后得到整理好的、可直接粘贴的书面文字。
 > Windows 桌面小工具 · GPU 本地转写 · DeepSeek 校对 · 托盘常驻 · 无黑框启动。
+>
+> GitHub 仓库：<https://github.com/Archwindos/voice2text>
 
 <p align="center">
   <img src="docs/home-result.png" alt="语声成文 · 语音输入页" width="900">
